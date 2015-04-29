@@ -290,7 +290,7 @@ gst_gl_generate_texture_full (GstGLContext * context, const GstVideoInfo * info,
     case GST_VIDEO_FORMAT_Y42B:
     case GST_VIDEO_FORMAT_Y41B:
     {
-      stride[comp] = GST_ROUND_UP_4 (GST_VIDEO_INFO_COMP_WIDTH (info, comp));;
+      stride[comp] = GST_ROUND_UP_4 (GST_VIDEO_INFO_COMP_WIDTH (info, comp));
       size[comp] = stride[comp] * GST_VIDEO_INFO_COMP_HEIGHT (info, comp);
       if (comp == 0)
         offset[0] = 0;
@@ -487,7 +487,7 @@ gst_gl_display_found (GstElement * element, GstGLDisplay * display)
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_CONTEXT);
 
 static gboolean
-context_pad_query (const GValue * item, GValue * value, gpointer user_data)
+pad_query (const GValue * item, GValue * value, gpointer user_data)
 {
   GstPad *pad = g_value_get_object (item);
   GstQuery *query = user_data;
@@ -500,16 +500,16 @@ context_pad_query (const GValue * item, GValue * value, gpointer user_data)
     return FALSE;
   }
 
-  GST_CAT_INFO_OBJECT (GST_CAT_CONTEXT, pad, "context pad peer query failed");
+  GST_CAT_INFO_OBJECT (GST_CAT_CONTEXT, pad, "pad peer query failed");
   return TRUE;
 }
 
-static gboolean
-run_context_query (GstElement * element, GstQuery * query,
+gboolean
+gst_gl_run_query (GstElement * element, GstQuery * query,
     GstPadDirection direction)
 {
   GstIterator *it;
-  GstIteratorFoldFunction func = context_pad_query;
+  GstIteratorFoldFunction func = pad_query;
   GValue res = { 0 };
 
   g_value_init (&res, G_TYPE_BOOLEAN);
@@ -541,11 +541,11 @@ _gst_context_query (GstElement * element,
    *  2b) Query upstream as above.
    */
   query = gst_query_new_context (display_type);
-  if (run_context_query (element, query, GST_PAD_SRC)) {
+  if (gst_gl_run_query (element, query, GST_PAD_SRC)) {
     gst_query_parse_context (query, &ctxt);
     GST_CAT_INFO_OBJECT (GST_CAT_CONTEXT, element,
         "found context (%p) in downstream query", ctxt);
-  } else if (run_context_query (element, query, GST_PAD_SINK)) {
+  } else if (gst_gl_run_query (element, query, GST_PAD_SINK)) {
     gst_query_parse_context (query, &ctxt);
     GST_CAT_INFO_OBJECT (GST_CAT_CONTEXT, element,
         "found context (%p) in upstream query", ctxt);
@@ -577,8 +577,8 @@ _gst_context_query (GstElement * element,
 static void
 gst_gl_display_context_query (GstElement * element, GstGLDisplay ** display_ptr)
 {
-  GstContext *ctxt;
-  GstQuery *query;
+  GstContext *ctxt = NULL;
+  GstQuery *query = NULL;
 
 #ifndef GST_DISABLE_GST_DEBUG
   if (!GST_CAT_CONTEXT)
@@ -588,8 +588,12 @@ gst_gl_display_context_query (GstElement * element, GstGLDisplay ** display_ptr)
   query =
       _gst_context_query (element, display_ptr, GST_GL_DISPLAY_CONTEXT_TYPE);
   gst_query_parse_context (query, &ctxt);
-  if (ctxt && gst_context_has_context_type (ctxt, GST_GL_DISPLAY_CONTEXT_TYPE))
-    gst_context_get_gl_display (ctxt, display_ptr);
+
+  if (ctxt && gst_context_has_context_type (ctxt, GST_GL_DISPLAY_CONTEXT_TYPE)) {
+    GstGLDisplay *tmp_disp = NULL;
+    if (gst_context_get_gl_display (ctxt, &tmp_disp) && tmp_disp)
+      *display_ptr = tmp_disp;
+  }
 
   if (*display_ptr)
     goto out;
@@ -633,7 +637,10 @@ gst_gl_context_query (GstElement * element, GstGLContext ** context_ptr)
   gst_query_parse_context (query, &ctxt);
   if (ctxt && gst_context_has_context_type (ctxt, "gst.gl.app_context")) {
     const GstStructure *s = gst_context_get_structure (ctxt);
-    gst_structure_get (s, "context", GST_GL_TYPE_CONTEXT, context_ptr, NULL);
+    GstGLContext *tmp_ctx = NULL;
+    if (gst_structure_get (s, "context", GST_GL_TYPE_CONTEXT, &tmp_ctx, NULL)
+        && tmp_ctx)
+      *context_ptr = tmp_ctx;
   }
 
   gst_query_unref (query);
@@ -871,4 +878,29 @@ gst_gl_get_plane_data_size (GstVideoInfo * info, GstVideoAlignment * align,
   plane_size = GST_VIDEO_INFO_PLANE_STRIDE (info, plane) * padded_height;
 
   return plane_size;
+}
+
+GstCaps *
+gst_gl_caps_replace_all_caps_features (const GstCaps * caps,
+    const gchar * feature_name)
+{
+  GstCaps *tmp = gst_caps_copy (caps);
+  guint n = gst_caps_get_size (tmp);
+  guint i = 0;
+
+  for (i = 0; i < n; i++) {
+    GstCapsFeatures *features = gst_caps_get_features (tmp, i);
+    if (features) {
+      guint n_f = gst_caps_features_get_size (features);
+      guint j = 0;
+      for (j = 0; j < n_f; j++) {
+        gst_caps_features_remove_id (features,
+            gst_caps_features_get_nth_id (features, j));
+      }
+    }
+
+    gst_caps_features_add (features, feature_name);
+  }
+
+  return tmp;
 }

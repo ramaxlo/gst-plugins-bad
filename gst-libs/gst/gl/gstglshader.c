@@ -170,7 +170,7 @@ gst_gl_shader_finalize (GObject * object)
   shader = GST_GL_SHADER (object);
   priv = shader->priv;
 
-  GST_TRACE ("finalizing shader %u", priv->program_handle);
+  GST_TRACE_OBJECT (shader, "finalizing shader %u", priv->program_handle);
 
   g_free (priv->vertex_src);
   g_free (priv->fragment_src);
@@ -401,6 +401,9 @@ gst_gl_shader_new (GstGLContext * context)
 
   shader = g_object_new (GST_GL_TYPE_SHADER, NULL);
   shader->context = gst_object_ref (context);
+
+  GST_DEBUG_OBJECT (shader, "Created new GLShader for context %" GST_PTR_FORMAT,
+      context);
 
   return shader;
 }
@@ -1164,9 +1167,12 @@ gst_gl_shader_get_attribute_location (GstGLShader * shader, const gchar * name)
   GstGLShaderPrivate *priv;
   GstGLFuncs *gl;
 
-  g_return_val_if_fail (shader != NULL, 0);
+  g_return_val_if_fail (shader != NULL, -1);
   priv = shader->priv;
-  g_return_val_if_fail (priv->program_handle != 0, 0);
+  g_return_val_if_fail (priv->program_handle != 0, -1);
+  if (0 == priv->vertex_handle)
+    return -1;
+
   gl = shader->context->gl_vtable;
 
   return gl->GetAttribLocation (priv->program_handle, name);

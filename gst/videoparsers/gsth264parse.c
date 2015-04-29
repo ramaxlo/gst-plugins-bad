@@ -41,8 +41,7 @@ GST_DEBUG_CATEGORY (h264_parse_debug);
 enum
 {
   PROP_0,
-  PROP_CONFIG_INTERVAL,
-  PROP_LAST
+  PROP_CONFIG_INTERVAL
 };
 
 enum
@@ -195,8 +194,10 @@ gst_h264_parse_reset_frame (GstH264Parse * h264parse)
 }
 
 static void
-gst_h264_parse_reset (GstH264Parse * h264parse)
+gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
 {
+  gint i;
+
   h264parse->width = 0;
   h264parse->height = 0;
   h264parse->fps_num = 0;
@@ -205,19 +206,32 @@ gst_h264_parse_reset (GstH264Parse * h264parse)
   h264parse->upstream_par_d = -1;
   h264parse->parsed_par_n = 0;
   h264parse->parsed_par_d = 0;
-  gst_buffer_replace (&h264parse->codec_data, NULL);
-  gst_buffer_replace (&h264parse->codec_data_in, NULL);
-  h264parse->nal_length_size = 4;
-  h264parse->packetized = FALSE;
-  h264parse->transform = FALSE;
+  h264parse->have_pps = FALSE;
+  h264parse->have_sps = FALSE;
 
   h264parse->align = GST_H264_PARSE_ALIGN_NONE;
   h264parse->format = GST_H264_PARSE_FORMAT_NONE;
 
-  h264parse->last_report = GST_CLOCK_TIME_NONE;
+  h264parse->transform = FALSE;
+  h264parse->nal_length_size = 4;
+  h264parse->packetized = FALSE;
   h264parse->push_codec = FALSE;
-  h264parse->have_pps = FALSE;
-  h264parse->have_sps = FALSE;
+
+  gst_buffer_replace (&h264parse->codec_data, NULL);
+  gst_buffer_replace (&h264parse->codec_data_in, NULL);
+
+  gst_h264_parse_reset_frame (h264parse);
+
+  for (i = 0; i < GST_H264_MAX_SPS_COUNT; i++)
+    gst_buffer_replace (&h264parse->sps_nals[i], NULL);
+  for (i = 0; i < GST_H264_MAX_PPS_COUNT; i++)
+    gst_buffer_replace (&h264parse->pps_nals[i], NULL);
+}
+
+static void
+gst_h264_parse_reset (GstH264Parse * h264parse)
+{
+  h264parse->last_report = GST_CLOCK_TIME_NONE;
 
   h264parse->dts = GST_CLOCK_TIME_NONE;
   h264parse->ts_trn_nb = GST_CLOCK_TIME_NONE;
@@ -230,7 +244,7 @@ gst_h264_parse_reset (GstH264Parse * h264parse)
 
   h264parse->discont = FALSE;
 
-  gst_h264_parse_reset_frame (h264parse);
+  gst_h264_parse_reset_stream_info (h264parse);
 }
 
 static gboolean
@@ -257,16 +271,10 @@ gst_h264_parse_start (GstBaseParse * parse)
 static gboolean
 gst_h264_parse_stop (GstBaseParse * parse)
 {
-  guint i;
   GstH264Parse *h264parse = GST_H264_PARSE (parse);
 
   GST_DEBUG_OBJECT (parse, "stop");
   gst_h264_parse_reset (h264parse);
-
-  for (i = 0; i < GST_H264_MAX_SPS_COUNT; i++)
-    gst_buffer_replace (&h264parse->sps_nals[i], NULL);
-  for (i = 0; i < GST_H264_MAX_PPS_COUNT; i++)
-    gst_buffer_replace (&h264parse->pps_nals[i], NULL);
 
   gst_h264_nal_parser_free (h264parse->nalparser);
 
@@ -878,7 +886,6 @@ gst_h264_parse_handle_frame_packetized (GstBaseParse * parse,
     if (h264parse->split_packetized) {
       GST_ELEMENT_ERROR (h264parse, STREAM, FAILED, (NULL),
           ("invalid AVC input data"));
-      gst_buffer_unref (buffer);
 
       return GST_FLOW_ERROR;
     } else {
@@ -2079,11 +2086,19 @@ gst_h264_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
   guint format, align, off;
   GstH264NalUnit nalu;
   GstH264ParserResult parseres;
+  GstCaps *old_caps;
 
   h264parse = GST_H264_PARSE (parse);
 
   /* reset */
   h264parse->push_codec = FALSE;
+
+  old_caps = gst_pad_get_current_caps (GST_BASE_PARSE_SINK_PAD (parse));
+  if (old_caps) {
+    if (!gst_caps_is_equal (old_caps, caps))
+      gst_h264_parse_reset_stream_info (h264parse);
+    gst_caps_unref (old_caps);
+  }
 
   str = gst_caps_get_structure (caps, 0);
 
@@ -2221,11 +2236,6 @@ gst_h264_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
     h264parse->packetized = FALSE;
     /* we have 4 sync bytes */
     h264parse->nal_length_size = 4;
-
-    if (format == GST_H264_PARSE_FORMAT_NONE) {
-      format = GST_H264_PARSE_FORMAT_BYTE;
-      align = GST_H264_PARSE_ALIGN_AU;
-    }
   } else {
     /* probably AVC3 without codec_data field, anything to do here? */
   }

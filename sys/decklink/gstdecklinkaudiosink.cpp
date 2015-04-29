@@ -54,6 +54,9 @@ struct _GstDecklinkAudioSinkRingBuffer
 
   GstDecklinkOutput *output;
   GstDecklinkAudioSink *sink;
+
+  GMutex clock_id_lock;
+  GstClockID clock_id;
 };
 
 struct _GstDecklinkAudioSinkRingBufferClass
@@ -122,6 +125,7 @@ static void
 static void
 gst_decklink_audio_sink_ringbuffer_init (GstDecklinkAudioSinkRingBuffer * self)
 {
+  g_mutex_init (&self->clock_id_lock);
 }
 
 static void
@@ -132,6 +136,7 @@ gst_decklink_audio_sink_ringbuffer_finalize (GObject * object)
 
   gst_object_unref (self->sink);
   self->sink = NULL;
+  g_mutex_clear (&self->clock_id_lock);
 
   G_OBJECT_CLASS (ringbuffer_parent_class)->finalize (object);
 }
@@ -193,9 +198,59 @@ public:
     gint bpf;
     guint written, written_sum;
     HRESULT res;
+    const GstAudioRingBufferSpec *spec =
+        &GST_AUDIO_RING_BUFFER_CAST (m_ringbuffer)->spec;
+    guint delay, max_delay;
 
     GST_LOG_OBJECT (m_ringbuffer->sink, "Writing audio samples (preroll: %d)",
         preroll);
+
+    delay =
+        gst_audio_ring_buffer_delay (GST_AUDIO_RING_BUFFER_CAST (m_ringbuffer));
+    max_delay = MAX ((spec->segtotal * spec->segsize) / 2, spec->segsize);
+    max_delay /= GST_AUDIO_INFO_BPF (&spec->info);
+    if (delay > max_delay) {
+      GstClock *clock =
+          gst_element_get_clock (GST_ELEMENT_CAST (m_ringbuffer->sink));
+      GstClockTime wait_time;
+      GstClockID clock_id;
+      GstClockReturn clock_ret;
+
+      GST_DEBUG_OBJECT (m_ringbuffer->sink, "Delay %u > max delay %u", delay,
+          max_delay);
+
+      wait_time =
+          gst_util_uint64_scale (delay - max_delay, GST_SECOND,
+          GST_AUDIO_INFO_RATE (&spec->info));
+      GST_DEBUG_OBJECT (m_ringbuffer->sink, "Waiting for %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (wait_time));
+      wait_time += gst_clock_get_time (clock);
+
+      g_mutex_lock (&m_ringbuffer->clock_id_lock);
+      if (!GST_AUDIO_RING_BUFFER_CAST (m_ringbuffer)->acquired) {
+        GST_DEBUG_OBJECT (m_ringbuffer->sink,
+            "Ringbuffer not acquired anymore");
+        g_mutex_unlock (&m_ringbuffer->clock_id_lock);
+        gst_object_unref (clock);
+        return S_OK;
+      }
+      clock_id = gst_clock_new_single_shot_id (clock, wait_time);
+      m_ringbuffer->clock_id = clock_id;
+      g_mutex_unlock (&m_ringbuffer->clock_id_lock);
+      gst_object_unref (clock);
+
+      clock_ret = gst_clock_id_wait (clock_id, NULL);
+
+      g_mutex_lock (&m_ringbuffer->clock_id_lock);
+      gst_clock_id_unref (clock_id);
+      m_ringbuffer->clock_id = NULL;
+      g_mutex_unlock (&m_ringbuffer->clock_id_lock);
+
+      if (clock_ret == GST_CLOCK_UNSCHEDULED) {
+        GST_DEBUG_OBJECT (m_ringbuffer->sink, "Flushing");
+        return S_OK;
+      }
+    }
 
     if (!gst_audio_ring_buffer_prepare_read (GST_AUDIO_RING_BUFFER_CAST
             (m_ringbuffer), &seg, &ptr, &len)) {
@@ -391,9 +446,20 @@ gst_decklink_audio_sink_ringbuffer_release (GstAudioRingBuffer * rb)
 
   GST_DEBUG_OBJECT (self->sink, "Release");
 
-  if (self->output)
-    self->output->output->DisableAudioOutput ();
+  if (self->output) {
+    g_mutex_lock (&self->clock_id_lock);
+    if (self->clock_id)
+      gst_clock_id_unschedule (self->clock_id);
+    g_mutex_unlock (&self->clock_id_lock);
 
+    g_mutex_lock (&self->output->lock);
+    self->output->audio_enabled = FALSE;
+    if (self->output->start_scheduled_playback && self->output->videosink)
+      self->output->start_scheduled_playback (self->output->videosink);
+    g_mutex_unlock (&self->output->lock);
+
+    self->output->output->DisableAudioOutput ();
+  }
   // free the buffer
   g_free (rb->memory);
   rb->memory = NULL;
@@ -461,6 +527,9 @@ static void gst_decklink_audio_sink_get_property (GObject * object,
     guint property_id, GValue * value, GParamSpec * pspec);
 static void gst_decklink_audio_sink_finalize (GObject * object);
 
+static GstStateChangeReturn gst_decklink_audio_sink_change_state (GstElement *
+    element, GstStateChange transition);
+
 static GstAudioRingBuffer
     * gst_decklink_audio_sink_create_ringbuffer (GstAudioBaseSink * absink);
 
@@ -479,6 +548,9 @@ gst_decklink_audio_sink_class_init (GstDecklinkAudioSinkClass * klass)
   gobject_class->set_property = gst_decklink_audio_sink_set_property;
   gobject_class->get_property = gst_decklink_audio_sink_get_property;
   gobject_class->finalize = gst_decklink_audio_sink_finalize;
+
+  element_class->change_state =
+      GST_DEBUG_FUNCPTR (gst_decklink_audio_sink_change_state);
 
   audiobasesink_class->create_ringbuffer =
       GST_DEBUG_FUNCPTR (gst_decklink_audio_sink_create_ringbuffer);
@@ -549,6 +621,35 @@ void
 gst_decklink_audio_sink_finalize (GObject * object)
 {
   G_OBJECT_CLASS (parent_class)->finalize (object);
+}
+
+static GstStateChangeReturn
+gst_decklink_audio_sink_change_state (GstElement * element,
+    GstStateChange transition)
+{
+  GstDecklinkAudioSink *self = GST_DECKLINK_AUDIO_SINK_CAST (element);
+  GstDecklinkAudioSinkRingBuffer *buf =
+      GST_DECKLINK_AUDIO_SINK_RING_BUFFER_CAST (GST_AUDIO_BASE_SINK_CAST
+      (self)->ringbuffer);
+  GstStateChangeReturn ret;
+
+  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+  if (ret == GST_STATE_CHANGE_FAILURE)
+    return ret;
+
+  switch (transition) {
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      g_mutex_lock (&buf->output->lock);
+      buf->output->audio_enabled = TRUE;
+      if (buf->output->start_scheduled_playback && buf->output->videosink)
+        buf->output->start_scheduled_playback (buf->output->videosink);
+      g_mutex_unlock (&buf->output->lock);
+      break;
+    default:
+      break;
+  }
+
+  return ret;
 }
 
 static GstAudioRingBuffer *

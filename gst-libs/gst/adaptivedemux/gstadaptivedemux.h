@@ -24,6 +24,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstadapter.h>
+#include <gst/uridownloader/gsturidownloader.h>
 
 G_BEGIN_DECLS
 
@@ -142,7 +143,16 @@ struct _GstAdaptiveDemuxStream
   gint64 download_chunk_start_time;
   gint64 download_total_time;
   gint64 download_total_bytes;
-  gint current_download_rate;
+  guint64 current_download_rate;
+
+  /* Per fragment download information */
+  guint64 fragment_total_time;
+  guint64 fragment_total_size;
+
+  /* Average for the last fragments */
+  guint64 moving_bitrate;
+  guint moving_index;
+  guint64 *fragment_bitrates;
 
   GstAdaptiveDemuxStreamFragment fragment;
 
@@ -167,7 +177,7 @@ struct _GstAdaptiveDemux
   /*< protected >*/
   GstPad         *sinkpad;
 
-  GstAdaptiveDemuxPrivate *priv;
+  GstUriDownloader *downloader;
 
   GList *streams;
   GList *next_streams;
@@ -182,8 +192,16 @@ struct _GstAdaptiveDemux
   gchar *manifest_uri;
   gchar *manifest_base_uri;
 
+  /* Properties */
+  guint num_lookback_fragments;
+  gfloat bitrate_limit;         /* limit of the available bitrate to use */
+  guint connection_speed;
+
   gboolean have_group_id;
   guint group_id;
+
+  /* < private > */
+  GstAdaptiveDemuxPrivate *priv;
 };
 
 /**
@@ -219,8 +237,22 @@ struct _GstAdaptiveDemuxClass
    * Returns: the update interval in microseconds
    */
   gint64        (*get_manifest_update_interval) (GstAdaptiveDemux * demux);
+
   /**
    * update_manifest:
+   * @demux: #GstAdaptiveDemux
+   *
+   * During live streaming, this will be called for the subclass to update its
+   * manifest with the new version. By default it fetches the manifest URI
+   * and passes it to GstAdaptiveDemux::update_manifest_data().
+   *
+   * Returns: #GST_FLOW_OK is all succeeded, #GST_FLOW_EOS if the stream ended
+   *          or #GST_FLOW_ERROR if an error happened
+   */
+  GstFlowReturn (*update_manifest) (GstAdaptiveDemux * demux);
+
+  /**
+   * update_manifest_data:
    * @demux: #GstAdaptiveDemux
    * @buf: Downloaded manifest data
    *
@@ -230,7 +262,7 @@ struct _GstAdaptiveDemuxClass
    * Returns: #GST_FLOW_OK is all succeeded, #GST_FLOW_EOS if the stream ended
    *          or #GST_FLOW_ERROR if an error happened
    */
-  GstFlowReturn (*update_manifest) (GstAdaptiveDemux * demux, GstBuffer * buf);
+  GstFlowReturn (*update_manifest_data) (GstAdaptiveDemux * demux, GstBuffer * buf);
 
   gboolean      (*is_live)          (GstAdaptiveDemux * demux);
   GstClockTime  (*get_duration)     (GstAdaptiveDemux * demux);
@@ -363,6 +395,18 @@ struct _GstAdaptiveDemuxClass
    * Return: %TRUE if successful
    */
   gboolean (*get_live_seek_range) (GstAdaptiveDemux * demux, gint64 * start, gint64 * stop);
+
+  /**
+   * get_presentation_offset:
+   * @demux: #GstAdaptiveDemux
+   * @stream: #GstAdaptiveDemuxStream
+   *
+   * Gets the delay to apply to @stream.
+   *
+   * Return: a #GstClockTime representing the (positive) time offset to apply to
+   * @stream.
+   */
+  GstClockTime (*get_presentation_offset) (GstAdaptiveDemux *demux, GstAdaptiveDemuxStream *stream);
 };
 
 GType    gst_adaptive_demux_get_type (void);

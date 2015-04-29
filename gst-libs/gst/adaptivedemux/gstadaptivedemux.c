@@ -75,7 +75,6 @@
 #include "gstadaptivedemux.h"
 #include "gst/gst-i18n-plugin.h"
 #include <gst/base/gstadapter.h>
-#include <gst/uridownloader/gsturidownloader.h>
 
 GST_DEBUG_CATEGORY (adaptivedemux_debug);
 #define GST_CAT_DEFAULT adaptivedemux_debug
@@ -86,6 +85,18 @@ GST_DEBUG_CATEGORY (adaptivedemux_debug);
 
 #define MAX_DOWNLOAD_ERROR_COUNT 3
 #define DEFAULT_FAILED_COUNT 3
+#define DEFAULT_LOOKBACK_FRAGMENTS 3
+#define DEFAULT_CONNECTION_SPEED 0
+#define DEFAULT_BITRATE_LIMIT 0.8
+
+enum
+{
+  PROP_0,
+  PROP_LOOKBACK_FRAGMENTS,
+  PROP_CONNECTION_SPEED,
+  PROP_BITRATE_LIMIT,
+  PROP_LAST
+};
 
 enum GstAdaptiveDemuxFlowReturn
 {
@@ -95,7 +106,7 @@ enum GstAdaptiveDemuxFlowReturn
 struct _GstAdaptiveDemuxPrivate
 {
   GstAdapter *input_adapter;
-  GstBuffer *manifest_buffer;
+  gboolean have_manifest;
 
   GstUriDownloader *downloader;
 
@@ -156,6 +167,8 @@ gst_adaptive_demux_stream_get_fragment_waiting_time (GstAdaptiveDemux * demux,
     GstAdaptiveDemuxStream * stream);
 static GstFlowReturn gst_adaptive_demux_update_manifest (GstAdaptiveDemux *
     demux);
+static GstFlowReturn
+gst_adaptive_demux_update_manifest_default (GstAdaptiveDemux * demux);
 static gboolean gst_adaptive_demux_has_next_period (GstAdaptiveDemux * demux);
 static void gst_adaptive_demux_advance_period (GstAdaptiveDemux * demux);
 
@@ -210,6 +223,52 @@ gst_adaptive_demux_get_type (void)
 }
 
 static void
+gst_adaptive_demux_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstAdaptiveDemux *demux = GST_ADAPTIVE_DEMUX (object);
+
+  switch (prop_id) {
+    case PROP_LOOKBACK_FRAGMENTS:
+      demux->num_lookback_fragments = g_value_get_uint (value);
+      break;
+    case PROP_CONNECTION_SPEED:
+      demux->connection_speed = g_value_get_uint (value) * 1000;
+      GST_DEBUG_OBJECT (demux, "Connection speed set to %u",
+          demux->connection_speed);
+      break;
+    case PROP_BITRATE_LIMIT:
+      demux->bitrate_limit = g_value_get_float (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+gst_adaptive_demux_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstAdaptiveDemux *demux = GST_ADAPTIVE_DEMUX (object);
+
+  switch (prop_id) {
+    case PROP_LOOKBACK_FRAGMENTS:
+      g_value_set_uint (value, demux->num_lookback_fragments);
+      break;
+    case PROP_CONNECTION_SPEED:
+      g_value_set_uint (value, demux->connection_speed / 1000);
+      break;
+    case PROP_BITRATE_LIMIT:
+      g_value_set_float (value, demux->bitrate_limit);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
 gst_adaptive_demux_class_init (GstAdaptiveDemuxClass * klass)
 {
   GObjectClass *gobject_class;
@@ -226,7 +285,30 @@ gst_adaptive_demux_class_init (GstAdaptiveDemuxClass * klass)
   parent_class = g_type_class_peek_parent (klass);
   g_type_class_add_private (klass, sizeof (GstAdaptiveDemuxPrivate));
 
+  gobject_class->set_property = gst_adaptive_demux_set_property;
+  gobject_class->get_property = gst_adaptive_demux_get_property;
   gobject_class->finalize = gst_adaptive_demux_finalize;
+
+  g_object_class_install_property (gobject_class, PROP_LOOKBACK_FRAGMENTS,
+      g_param_spec_uint ("num-lookback-fragments",
+          "Number of fragments to look back",
+          "The number of fragments the demuxer will look back to calculate an average bitrate",
+          1, G_MAXUINT, DEFAULT_LOOKBACK_FRAGMENTS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT_ONLY));
+
+  g_object_class_install_property (gobject_class, PROP_CONNECTION_SPEED,
+      g_param_spec_uint ("connection-speed", "Connection Speed",
+          "Network connection speed in kbps (0 = calculate from downloaded"
+          " fragments)", 0, G_MAXUINT / 1000, DEFAULT_CONNECTION_SPEED,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* FIXME 2.0: rename this property to bandwidth-usage or any better name */
+  g_object_class_install_property (gobject_class, PROP_BITRATE_LIMIT,
+      g_param_spec_float ("bitrate-limit",
+          "Bitrate limit in %",
+          "Limit of the available bitrate to use when switching to alternates.",
+          0, 1, DEFAULT_BITRATE_LIMIT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->change_state = gst_adaptive_demux_change_state;
 
@@ -234,6 +316,7 @@ gst_adaptive_demux_class_init (GstAdaptiveDemuxClass * klass)
 
   klass->data_received = gst_adaptive_demux_stream_data_received_default;
   klass->finish_fragment = gst_adaptive_demux_stream_finish_fragment_default;
+  klass->update_manifest = gst_adaptive_demux_update_manifest_default;
 }
 
 static void
@@ -247,7 +330,7 @@ gst_adaptive_demux_init (GstAdaptiveDemux * demux,
 
   demux->priv = GST_ADAPTIVE_DEMUX_GET_PRIVATE (demux);
   demux->priv->input_adapter = gst_adapter_new ();
-  demux->priv->downloader = gst_uri_downloader_new ();
+  demux->downloader = gst_uri_downloader_new ();
   demux->stream_struct_size = sizeof (GstAdaptiveDemuxStream);
 
   gst_segment_init (&demux->segment, GST_FORMAT_TIME);
@@ -274,6 +357,11 @@ gst_adaptive_demux_init (GstAdaptiveDemux * demux,
   gst_pad_set_chain_function (demux->sinkpad,
       GST_DEBUG_FUNCPTR (gst_adaptive_demux_sink_chain));
 
+  /* Properties */
+  demux->num_lookback_fragments = DEFAULT_LOOKBACK_FRAGMENTS;
+  demux->bitrate_limit = DEFAULT_BITRATE_LIMIT;
+  demux->connection_speed = DEFAULT_CONNECTION_SPEED;
+
   gst_element_add_pad (GST_ELEMENT (demux), demux->sinkpad);
 }
 
@@ -286,7 +374,7 @@ gst_adaptive_demux_finalize (GObject * object)
   GST_DEBUG_OBJECT (object, "finalize");
 
   g_object_unref (priv->input_adapter);
-  g_object_unref (priv->downloader);
+  g_object_unref (demux->downloader);
 
   g_mutex_clear (&priv->updates_timed_lock);
   g_cond_clear (&priv->updates_timed_cond);
@@ -334,6 +422,7 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
       gboolean query_res;
       gboolean ret = TRUE;
       gsize available;
+      GstBuffer *manifest_buffer;
 
       demux_class = GST_ADAPTIVE_DEMUX_GET_CLASS (demux);
       available = gst_adapter_available (demux->priv->input_adapter);
@@ -375,16 +464,19 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
       gst_query_unref (query);
 
       /* Let the subclass parse the manifest */
-      demux->priv->manifest_buffer =
+      manifest_buffer =
           gst_adapter_take_buffer (demux->priv->input_adapter, available);
-      if (!demux_class->process_manifest (demux, demux->priv->manifest_buffer)) {
+      if (!demux_class->process_manifest (demux, manifest_buffer)) {
         /* In most cases, this will happen if we set a wrong url in the
          * source element and we have received the 404 HTML response instead of
          * the manifest */
         GST_ELEMENT_ERROR (demux, STREAM, DECODE, ("Invalid manifest."),
             (NULL));
         ret = FALSE;
+      } else {
+        demux->priv->have_manifest = TRUE;
       }
+      gst_buffer_unref (manifest_buffer);
 
       gst_element_post_message (GST_ELEMENT_CAST (demux),
           gst_message_new_element (GST_OBJECT_CAST (demux),
@@ -467,7 +559,7 @@ gst_adaptive_demux_reset (GstAdaptiveDemux * demux)
   GList *iter;
 
   gst_adaptive_demux_stop_tasks (demux);
-  gst_uri_downloader_reset (demux->priv->downloader);
+  gst_uri_downloader_reset (demux->downloader);
 
   if (klass->reset)
     klass->reset (demux);
@@ -493,10 +585,7 @@ gst_adaptive_demux_reset (GstAdaptiveDemux * demux)
   demux->manifest_base_uri = NULL;
 
   gst_adapter_clear (demux->priv->input_adapter);
-  if (demux->priv->manifest_buffer) {
-    gst_buffer_unref (demux->priv->manifest_buffer);
-    demux->priv->manifest_buffer = NULL;
-  }
+  demux->priv->have_manifest = FALSE;
 
   gst_segment_init (&demux->segment, GST_FORMAT_TIME);
 
@@ -615,6 +704,20 @@ gst_adaptive_demux_expose_stream (GstAdaptiveDemux * demux,
   return gst_element_add_pad (GST_ELEMENT_CAST (demux), pad);
 }
 
+static GstClockTime
+gst_adaptive_demux_stream_get_presentation_offset (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream)
+{
+  GstAdaptiveDemuxClass *klass;
+
+  klass = GST_ADAPTIVE_DEMUX_GET_CLASS (demux);
+
+  if (klass->get_presentation_offset == NULL)
+    return 0;
+
+  return klass->get_presentation_offset (demux, stream);
+}
+
 static gboolean
 gst_adaptive_demux_expose_streams (GstAdaptiveDemux * demux,
     gboolean first_segment)
@@ -651,11 +754,16 @@ gst_adaptive_demux_expose_streams (GstAdaptiveDemux * demux,
   }
 
   if (first_segment)
-    demux->segment.start = demux->segment.position = min_pts;
+    demux->segment.start = demux->segment.position = demux->segment.time =
+        min_pts;
   for (iter = demux->streams; iter; iter = g_list_next (iter)) {
     GstAdaptiveDemuxStream *stream = iter->data;
+    GstClockTime offset;
 
+    offset = gst_adaptive_demux_stream_get_presentation_offset (demux, stream);
     stream->segment = demux->segment;
+    stream->segment.start = stream->segment.position =
+        stream->fragment.timestamp + offset;
     stream->pending_segment = gst_event_new_segment (&stream->segment);
   }
 
@@ -666,7 +774,7 @@ gst_adaptive_demux_expose_streams (GstAdaptiveDemux * demux,
     GstEvent *eos = gst_event_new_eos ();
 
     for (iter = old_streams; iter; iter = g_list_next (iter)) {
-      GstAdaptiveDemuxStream *stream = iter->data;;
+      GstAdaptiveDemuxStream *stream = iter->data;
 
       GST_LOG_OBJECT (stream->pad, "Removing stream");
       gst_pad_push_event (stream->pad, gst_event_ref (eos));
@@ -702,6 +810,8 @@ gst_adaptive_demux_stream_new (GstAdaptiveDemux * demux, GstPad * pad)
 
   stream->pad = pad;
   stream->demux = demux;
+  stream->fragment_bitrates =
+      g_malloc0 (sizeof (guint64) * demux->num_lookback_fragments);
   gst_pad_set_element_private (pad, stream);
 
   gst_pad_set_query_function (pad,
@@ -765,6 +875,8 @@ gst_adaptive_demux_stream_free (GstAdaptiveDemuxStream * stream)
 
   g_cond_clear (&stream->fragment_download_cond);
   g_mutex_clear (&stream->fragment_download_lock);
+
+  g_free (stream->fragment_bitrates);
 
   if (stream->pad) {
     gst_object_unref (stream->pad);
@@ -993,7 +1105,8 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
 
       GST_MANIFEST_LOCK (demux);
       gst_query_parse_duration (query, &fmt, NULL);
-      if (fmt == GST_FORMAT_TIME && demux->priv->manifest_buffer != NULL) {
+      if (fmt == GST_FORMAT_TIME && demux->priv->have_manifest
+          && !gst_adaptive_demux_is_live (demux)) {
         duration = demux_class->get_duration (demux);
 
         if (GST_CLOCK_TIME_IS_VALID (duration) && duration > 0) {
@@ -1007,13 +1120,7 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
       break;
     }
     case GST_QUERY_LATENCY:{
-      gboolean live = FALSE;
-
-      GST_MANIFEST_LOCK (demux);
-      live = demux->priv->manifest_buffer && gst_adaptive_demux_is_live (demux);
-      GST_MANIFEST_UNLOCK (demux);
-
-      gst_query_set_latency (query, live, 0, -1);
+      gst_query_set_latency (query, FALSE, 0, -1);
       ret = TRUE;
       break;
     }
@@ -1023,7 +1130,7 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
       gint64 start = 0;
 
       GST_MANIFEST_LOCK (demux);
-      if (demux->priv->manifest_buffer == NULL) {
+      if (demux->priv->have_manifest) {
         GST_MANIFEST_UNLOCK (demux);
         return FALSE;           /* can't answer without manifest */
       }
@@ -1103,7 +1210,7 @@ gst_adaptive_demux_stop_tasks (GstAdaptiveDemux * demux)
   g_cond_broadcast (&demux->manifest_cond);
   GST_MANIFEST_UNLOCK (demux);
 
-  gst_uri_downloader_cancel (demux->priv->downloader);
+  gst_uri_downloader_cancel (demux->downloader);
   for (iter = demux->streams; iter; iter = g_list_next (iter)) {
     GstAdaptiveDemuxStream *stream = iter->data;
 
@@ -1165,26 +1272,57 @@ gst_adaptive_demux_stream_set_tags (GstAdaptiveDemuxStream * stream,
 }
 
 static guint64
-gst_adaptive_demux_stream_update_current_bitrate (GstAdaptiveDemuxStream *
-    stream)
+_update_average_bitrate (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream, guint64 new_bitrate)
 {
-  guint64 bitrate = 0;
+  gint index = stream->moving_index % demux->num_lookback_fragments;
 
-  if (stream->download_total_time)
-    bitrate =
-        (stream->download_total_bytes * 8) /
-        ((double) stream->download_total_time / G_GUINT64_CONSTANT (1000000));
+  stream->moving_bitrate -= stream->fragment_bitrates[index];
+  stream->fragment_bitrates[index] = new_bitrate;
+  stream->moving_bitrate += new_bitrate;
 
-  if (stream->current_download_rate != -1)
-    bitrate = (stream->current_download_rate + bitrate * 3) / 4;
-  if (bitrate > G_MAXINT)
-    bitrate = G_MAXINT;
-  stream->current_download_rate = bitrate;
-  GST_DEBUG_OBJECT (stream->pad, "Bitrate: %" G_GUINT64_FORMAT
-      " (bytes: %" G_GINT64_FORMAT " / %" G_GINT64_FORMAT " microsecs",
-      bitrate, stream->download_total_bytes, stream->download_total_time);
+  stream->moving_index += 1;
 
-  return bitrate;
+  if (stream->moving_index > demux->num_lookback_fragments)
+    return stream->moving_bitrate / demux->num_lookback_fragments;
+  return stream->moving_bitrate / stream->moving_index;
+}
+
+static guint64
+gst_adaptive_demux_stream_update_current_bitrate (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream)
+{
+  guint64 average_bitrate;
+  guint64 fragment_bitrate;
+
+  fragment_bitrate =
+      (stream->fragment_total_size * 8) /
+      ((double) stream->fragment_total_time / G_GUINT64_CONSTANT (1000000));
+  stream->fragment_total_size = 0;
+  stream->fragment_total_time = 0;
+
+  average_bitrate = _update_average_bitrate (demux, stream, fragment_bitrate);
+
+  GST_INFO_OBJECT (stream, "last fragment bitrate was %" G_GUINT64_FORMAT,
+      fragment_bitrate);
+  GST_INFO_OBJECT (stream,
+      "Last %u fragments average bitrate is %" G_GUINT64_FORMAT,
+      demux->num_lookback_fragments, average_bitrate);
+
+  /* Conservative approach, make sure we don't upgrade too fast */
+  stream->current_download_rate = MIN (average_bitrate, fragment_bitrate);
+
+  if (demux->connection_speed) {
+    GST_LOG_OBJECT (demux, "Connection-speed is set to %u kbps, using it",
+        demux->connection_speed / 1000);
+    return demux->connection_speed;
+  }
+
+  stream->current_download_rate *= demux->bitrate_limit;
+  GST_DEBUG_OBJECT (demux, "Bitrate after bitrate limit (%0.2f): %"
+      G_GUINT64_FORMAT, demux->bitrate_limit, stream->current_download_rate);
+
+  return stream->current_download_rate;
 }
 
 static GstFlowReturn
@@ -1225,6 +1363,8 @@ gst_adaptive_demux_stream_push_buffer (GstAdaptiveDemuxStream * stream,
   GstAdaptiveDemux *demux = stream->demux;
   GstFlowReturn ret = GST_FLOW_OK;
   gboolean discont = FALSE;
+  GstClockTime offset =
+      gst_adaptive_demux_stream_get_presentation_offset (demux, stream);
 
   if (stream->first_fragment_buffer) {
     if (demux->segment.rate < 0)
@@ -1253,6 +1393,8 @@ gst_adaptive_demux_stream_push_buffer (GstAdaptiveDemuxStream * stream,
 
   stream->first_fragment_buffer = FALSE;
 
+  if (GST_BUFFER_PTS (buffer) != GST_CLOCK_TIME_NONE)
+    GST_BUFFER_PTS (buffer) += offset;
   GST_BUFFER_DURATION (buffer) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DTS (buffer) = GST_CLOCK_TIME_NONE;
 
@@ -1337,6 +1479,10 @@ _src_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
       g_get_monotonic_time () - stream->download_chunk_start_time;
   stream->download_total_bytes += gst_buffer_get_size (buffer);
 
+  stream->fragment_total_size += gst_buffer_get_size (buffer);
+  stream->fragment_total_time +=
+      g_get_monotonic_time () - stream->download_chunk_start_time;
+
   gst_adapter_push (stream->adapter, buffer);
   GST_DEBUG_OBJECT (stream->pad, "Received buffer of size %" G_GSIZE_FORMAT
       ". Now %" G_GSIZE_FORMAT " on adapter", gst_buffer_get_size (buffer),
@@ -1370,7 +1516,6 @@ gst_adaptive_demux_stream_fragment_download_finish (GstAdaptiveDemuxStream *
 {
   g_mutex_lock (&stream->fragment_download_lock);
   stream->download_finished = TRUE;
-  stream->last_ret = ret;
 
   /* if we have an error, only replace last_ret if it was OK before to avoid
    * overwriting the first error we got */
@@ -2120,7 +2265,8 @@ gst_adaptive_demux_updates_loop (GstAdaptiveDemux * demux)
             g_get_monotonic_time () +
             klass->get_manifest_update_interval (demux);
       } else {
-        GST_ERROR_OBJECT (demux, "Could not update playlist");
+        GST_ELEMENT_ERROR (demux, STREAM, FAILED,
+            (_("Internal data stream error.")), ("Could not update playlist"));
         goto error;
       }
     } else {
@@ -2144,7 +2290,7 @@ quit:
 error:
   {
     GST_DEBUG_OBJECT (demux, "Stopped updates task because of error");
-    gst_adaptive_demux_stop_tasks (demux);
+    gst_task_stop (demux->priv->updates_task);
   }
 }
 
@@ -2229,6 +2375,8 @@ gst_adaptive_demux_stream_advance_fragment_unlocked (GstAdaptiveDemux * demux,
   g_clear_error (&stream->last_error);
   stream->download_total_time +=
       g_get_monotonic_time () - stream->download_chunk_start_time;
+  stream->fragment_total_time +=
+      g_get_monotonic_time () - stream->download_chunk_start_time;
 
   /* FIXME - url has no indication of byte ranges for subsegments */
   gst_element_post_message (GST_ELEMENT_CAST (demux),
@@ -2246,14 +2394,20 @@ gst_adaptive_demux_stream_advance_fragment_unlocked (GstAdaptiveDemux * demux,
 
   if (GST_CLOCK_TIME_IS_VALID (duration))
     stream->segment.position += duration;
-  ret = klass->stream_advance_fragment (stream);
+
+  if (gst_adaptive_demux_is_live (demux)
+      || gst_adaptive_demux_stream_has_next_fragment (demux, stream)) {
+    ret = klass->stream_advance_fragment (stream);
+  } else {
+    ret = GST_FLOW_EOS;
+  }
 
   stream->download_start_time = stream->download_chunk_start_time =
       g_get_monotonic_time ();
 
   if (ret == GST_FLOW_OK) {
     if (gst_adaptive_demux_stream_select_bitrate (demux, stream,
-            gst_adaptive_demux_stream_update_current_bitrate (stream))) {
+            gst_adaptive_demux_stream_update_current_bitrate (demux, stream))) {
       stream->need_header = TRUE;
       gst_adapter_clear (stream->adapter);
       ret = (GstFlowReturn) GST_ADAPTIVE_DEMUX_FLOW_SWITCH;
@@ -2315,17 +2469,16 @@ gst_adaptive_demux_stream_get_fragment_waiting_time (GstAdaptiveDemux *
 }
 
 static GstFlowReturn
-gst_adaptive_demux_update_manifest (GstAdaptiveDemux * demux)
+gst_adaptive_demux_update_manifest_default (GstAdaptiveDemux * demux)
 {
   GstAdaptiveDemuxClass *klass = GST_ADAPTIVE_DEMUX_GET_CLASS (demux);
   GstFragment *download;
   GstBuffer *buffer;
   GstFlowReturn ret;
 
-  download = gst_uri_downloader_fetch_uri (demux->priv->downloader,
+  download = gst_uri_downloader_fetch_uri (demux->downloader,
       demux->manifest_uri, NULL, TRUE, TRUE, TRUE, NULL);
   if (download) {
-
     GST_MANIFEST_LOCK (demux);
     g_free (demux->manifest_uri);
     g_free (demux->manifest_base_uri);
@@ -2339,33 +2492,42 @@ gst_adaptive_demux_update_manifest (GstAdaptiveDemux * demux)
 
     buffer = gst_fragment_get_buffer (download);
     g_object_unref (download);
-    ret = klass->update_manifest (demux, buffer);
-    if (ret == GST_FLOW_OK) {
-      GstClockTime duration;
-      gst_buffer_unref (demux->priv->manifest_buffer);
-      demux->priv->manifest_buffer = buffer;
-
-      /* Send an updated duration message */
-      duration = klass->get_duration (demux);
-
-      GST_MANIFEST_UNLOCK (demux);
-      if (duration != GST_CLOCK_TIME_NONE) {
-        GST_DEBUG_OBJECT (demux,
-            "Sending duration message : %" GST_TIME_FORMAT,
-            GST_TIME_ARGS (duration));
-        gst_element_post_message (GST_ELEMENT (demux),
-            gst_message_new_duration_changed (GST_OBJECT (demux)));
-      } else {
-        GST_DEBUG_OBJECT (demux,
-            "Duration unknown, can not send the duration message");
-      }
-    } else {
-      GST_MANIFEST_UNLOCK (demux);
-      gst_buffer_unref (buffer);
-      /* Should the manifest uri vars be reverted to original values? */
-    }
+    ret = klass->update_manifest_data (demux, buffer);
+    gst_buffer_unref (buffer);
+    GST_MANIFEST_UNLOCK (demux);
+    /* FIXME: Should the manifest uri vars be reverted to original
+     * values if updating fails? */
   } else {
     ret = GST_FLOW_NOT_LINKED;
+  }
+
+  return ret;
+}
+
+static GstFlowReturn
+gst_adaptive_demux_update_manifest (GstAdaptiveDemux * demux)
+{
+  GstAdaptiveDemuxClass *klass = GST_ADAPTIVE_DEMUX_GET_CLASS (demux);
+  GstFlowReturn ret;
+
+  ret = klass->update_manifest (demux);
+
+  if (ret == GST_FLOW_OK) {
+    GstClockTime duration;
+    GST_MANIFEST_LOCK (demux);
+    /* Send an updated duration message */
+    duration = klass->get_duration (demux);
+    GST_MANIFEST_UNLOCK (demux);
+    if (duration != GST_CLOCK_TIME_NONE) {
+      GST_DEBUG_OBJECT (demux,
+          "Sending duration message : %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (duration));
+      gst_element_post_message (GST_ELEMENT (demux),
+          gst_message_new_duration_changed (GST_OBJECT (demux)));
+    } else {
+      GST_DEBUG_OBJECT (demux,
+          "Duration unknown, can not send the duration message");
+    }
   }
 
   return ret;

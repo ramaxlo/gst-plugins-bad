@@ -1676,7 +1676,7 @@ gst_mxf_demux_handle_generic_container_essence_element (GstMXFDemux * demux,
 
   if (etrack->offsets && etrack->offsets->len > etrack->position) {
     GstMXFDemuxIndex *index =
-          &g_array_index (etrack->offsets, GstMXFDemuxIndex, etrack->position);
+        &g_array_index (etrack->offsets, GstMXFDemuxIndex, etrack->position);
     if (index->offset != 0)
       keyframe = index->keyframe;
   }
@@ -1898,16 +1898,14 @@ out:
 static void
 read_partition_header (GstMXFDemux * demux, guint64 offset)
 {
-  GstFlowReturn ret;
   GstBuffer *buf;
   MXFUL key;
   guint read;
 
-  ret = gst_mxf_demux_pull_klv_packet (demux, offset, &key, &buf, &read);
-  offset += read;
-
-  if (ret != GST_FLOW_OK)
+  if (gst_mxf_demux_pull_klv_packet (demux, offset, &key, &buf, &read)
+      != GST_FLOW_OK)
     return;
+  offset += read;
 
   if (!mxf_is_partition_pack (&key)) {
     gst_buffer_unref (buf);
@@ -1916,8 +1914,8 @@ read_partition_header (GstMXFDemux * demux, guint64 offset)
 
   do {
     gst_buffer_unref (buf);
-    ret = gst_mxf_demux_pull_klv_packet (demux, offset, &key, &buf, &read);
-    if (ret != GST_FLOW_OK)
+    if (gst_mxf_demux_pull_klv_packet (demux, offset, &key, &buf, &read)
+        != GST_FLOW_OK)
       return;
     offset += read;
   }
@@ -2050,11 +2048,13 @@ gst_mxf_demux_handle_index_table_segment (GstMXFDemux * demux,
       (GCompareFunc) compare_index_table_segments);
 
   /* Prevent duplicates */
-  if (l == NULL)
+  if (l == NULL) {
     demux->pending_index_table_segments =
         g_list_prepend (demux->pending_index_table_segments, segment);
-  else
+  } else {
+    mxf_index_table_segment_reset (segment);
     g_free (segment);
+  }
 
   return GST_FLOW_OK;
 }
@@ -2160,7 +2160,6 @@ static void
 gst_mxf_demux_pull_random_index_pack (GstMXFDemux * demux)
 {
   GstBuffer *buffer;
-  GstFlowReturn ret;
   gint64 filesize = -1;
   GstFormat fmt = GST_FORMAT_BYTES;
   guint32 pack_size;
@@ -2177,9 +2176,7 @@ gst_mxf_demux_pull_random_index_pack (GstMXFDemux * demux)
   g_assert (filesize > 4);
 
   buffer = NULL;
-  if ((ret =
-          gst_mxf_demux_pull_range (demux, filesize - 4, 4,
-              &buffer)) != GST_FLOW_OK) {
+  if (gst_mxf_demux_pull_range (demux, filesize - 4, 4, &buffer) != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (demux, "Failed pulling last 4 bytes");
     return;
   }
@@ -2199,9 +2196,8 @@ gst_mxf_demux_pull_random_index_pack (GstMXFDemux * demux)
   }
 
   buffer = NULL;
-  if ((ret =
-          gst_mxf_demux_pull_range (demux, filesize - pack_size, 16,
-              &buffer)) != GST_FLOW_OK) {
+  if (gst_mxf_demux_pull_range (demux, filesize - pack_size, 16,
+          &buffer) != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (demux, "Failed pulling random index pack key");
     return;
   }
@@ -2217,9 +2213,8 @@ gst_mxf_demux_pull_random_index_pack (GstMXFDemux * demux)
   }
 
   demux->offset = filesize - pack_size;
-  if ((ret =
-          gst_mxf_demux_pull_klv_packet (demux, filesize - pack_size, &key,
-              &buffer, NULL)) != GST_FLOW_OK) {
+  if (gst_mxf_demux_pull_klv_packet (demux, filesize - pack_size, &key,
+          &buffer, NULL) != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (demux, "Failed pulling random index pack");
     return;
   }
@@ -2236,7 +2231,7 @@ gst_mxf_demux_parse_footer_metadata (GstMXFDemux * demux)
   MXFUL key;
   GstBuffer *buffer = NULL;
   guint read = 0;
-  GstFlowReturn ret = GST_FLOW_OK;
+  GstFlowReturn flow = GST_FLOW_OK;
   GstMXFDemuxPartition *old_partition = demux->current_partition;
 
   demux->current_partition = NULL;
@@ -2253,10 +2248,10 @@ gst_mxf_demux_parse_footer_metadata (GstMXFDemux * demux)
   }
 
 next_try:
-  ret =
+  flow =
       gst_mxf_demux_pull_klv_packet (demux, demux->offset, &key, &buffer,
       &read);
-  if (G_UNLIKELY (ret != GST_FLOW_OK))
+  if (G_UNLIKELY (flow != GST_FLOW_OK))
     goto out;
 
   if (!mxf_is_partition_pack (&key))
@@ -2281,10 +2276,10 @@ next_try:
   }
 
   while (TRUE) {
-    ret =
+    flow =
         gst_mxf_demux_pull_klv_packet (demux, demux->offset, &key, &buffer,
         &read);
-    if (G_UNLIKELY (ret != GST_FLOW_OK)) {
+    if (G_UNLIKELY (flow != GST_FLOW_OK)) {
       demux->offset =
           demux->run_in +
           demux->current_partition->partition.this_partition -
@@ -2329,10 +2324,10 @@ next_try:
   while (demux->offset <
       demux->run_in + demux->current_partition->primer.offset +
       demux->current_partition->partition.header_byte_count) {
-    ret =
+    flow =
         gst_mxf_demux_pull_klv_packet (demux, demux->offset, &key, &buffer,
         &read);
-    if (G_UNLIKELY (ret != GST_FLOW_OK)) {
+    if (G_UNLIKELY (flow != GST_FLOW_OK)) {
       demux->offset =
           demux->run_in +
           demux->current_partition->partition.this_partition -
@@ -2341,12 +2336,12 @@ next_try:
     }
 
     if (mxf_is_metadata (&key)) {
-      ret = gst_mxf_demux_handle_metadata (demux, &key, buffer);
+      flow = gst_mxf_demux_handle_metadata (demux, &key, buffer);
       demux->offset += read;
       gst_buffer_unref (buffer);
       buffer = NULL;
 
-      if (G_UNLIKELY (ret != GST_FLOW_OK)) {
+      if (G_UNLIKELY (flow != GST_FLOW_OK)) {
         gst_mxf_demux_reset_metadata (demux);
         demux->offset =
             demux->run_in +
@@ -2355,7 +2350,7 @@ next_try:
         goto next_try;
       }
     } else if (mxf_is_descriptive_metadata (&key)) {
-      ret = gst_mxf_demux_handle_descriptive_metadata (demux, &key, buffer);
+      gst_mxf_demux_handle_descriptive_metadata (demux, &key, buffer);
       demux->offset += read;
       gst_buffer_unref (buffer);
       buffer = NULL;
@@ -2874,7 +2869,7 @@ static void
 gst_mxf_demux_loop (GstPad * pad)
 {
   GstMXFDemux *demux = NULL;
-  GstFlowReturn ret = GST_FLOW_OK;
+  GstFlowReturn flow = GST_FLOW_OK;
   GstMapInfo map;
   gboolean res;
 
@@ -2886,7 +2881,7 @@ gst_mxf_demux_loop (GstPad * pad)
     while (demux->offset < 64 * 1024) {
       GstBuffer *buffer = NULL;
 
-      if ((ret =
+      if ((flow =
               gst_mxf_demux_pull_range (demux, demux->offset, 16,
                   &buffer)) != GST_FLOW_OK)
         break;
@@ -2908,12 +2903,12 @@ gst_mxf_demux_loop (GstPad * pad)
       gst_buffer_unref (buffer);
     }
 
-    if (G_UNLIKELY (ret != GST_FLOW_OK))
+    if (G_UNLIKELY (flow != GST_FLOW_OK))
       goto pause;
 
     if (G_UNLIKELY (demux->run_in == -1)) {
       GST_ERROR_OBJECT (demux, "No valid header partition pack found");
-      ret = GST_FLOW_ERROR;
+      flow = GST_FLOW_ERROR;
       goto pause;
     }
 
@@ -2922,10 +2917,10 @@ gst_mxf_demux_loop (GstPad * pad)
   }
 
   /* Now actually do something */
-  ret = gst_mxf_demux_pull_and_handle_klv_packet (demux);
+  flow = gst_mxf_demux_pull_and_handle_klv_packet (demux);
 
   /* pause if something went wrong */
-  if (G_UNLIKELY (ret != GST_FLOW_OK))
+  if (G_UNLIKELY (flow != GST_FLOW_OK))
     goto pause;
 
   /* check EOS condition */
@@ -2945,7 +2940,7 @@ gst_mxf_demux_loop (GstPad * pad)
     }
 
     if (eos) {
-      ret = GST_FLOW_EOS;
+      flow = GST_FLOW_EOS;
       goto pause;
     }
   }
@@ -2956,12 +2951,12 @@ gst_mxf_demux_loop (GstPad * pad)
 
 pause:
   {
-    const gchar *reason = gst_flow_get_name (ret);
+    const gchar *reason = gst_flow_get_name (flow);
 
     GST_LOG_OBJECT (demux, "pausing task, reason %s", reason);
     gst_pad_pause_task (pad);
 
-    if (ret == GST_FLOW_EOS) {
+    if (flow == GST_FLOW_EOS) {
       /* perform EOS logic */
       if (demux->segment.flags & GST_SEEK_FLAG_SEGMENT) {
         gint64 stop;
@@ -2992,7 +2987,7 @@ pause:
           GST_WARNING_OBJECT (demux, "failed pushing EOS on streams");
         }
       }
-    } else if (ret == GST_FLOW_NOT_LINKED || ret < GST_FLOW_EOS) {
+    } else if (flow == GST_FLOW_NOT_LINKED || flow < GST_FLOW_EOS) {
       GstEvent *e;
 
       GST_ELEMENT_ERROR (demux, STREAM, FAILED,
@@ -3561,6 +3556,7 @@ gst_mxf_demux_seek_pull (GstMXFDemux * demux, GstEvent * event)
       }
       p->discont = TRUE;
     }
+    gst_flow_combiner_reset (demux->flowcombiner);
     if (new_offset == -1) {
       GST_WARNING_OBJECT (demux, "No new offset found");
       ret = FALSE;

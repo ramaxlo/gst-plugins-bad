@@ -136,6 +136,23 @@ static const gchar frag_REORDER[] =
       " gl_FragColor = vec4(t.%c, t.%c, t.%c, t.%c);\n"
       "}";
 
+static const gchar frag_APPLE_YUV_TO_RGB[] =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "varying vec2 v_texcoord;\n"
+      "uniform float width;\n"
+      "uniform float height;\n"
+      "uniform sampler2DRect tex;\n"
+      "uniform vec2 tex_scale0;\n"
+      "uniform vec2 tex_scale1;\n"
+      "uniform vec2 tex_scale2;\n"
+      "void main(void)\n"
+      "{\n"
+      " vec4 t = texture2DRect(tex, v_texcoord * vec2(width, height) * tex_scale0);\n"
+      " gl_FragColor = vec4(t.%c, t.%c, t.%c, t.%c);\n"
+      "}";
+
 /* GRAY16 to RGB conversion
  *  data transfered as GL_LUMINANCE_ALPHA then convert back to GRAY16 
  *  high byte weight as : 255*256/65535 
@@ -398,6 +415,9 @@ static const GLfloat vertices[] = {
     -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
      1.0f,  1.0f, 0.0f, 1.0f, 1.0f
 };
+
+static const GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
+
 /* *INDENT-ON* */
 
 struct ConvertInfo
@@ -424,6 +444,7 @@ struct _GstGLColorConvertPrivate
 
   GLuint vao;
   GLuint vertex_buffer;
+  GLuint vbo_indices;
   GLuint attr_position;
   GLuint attr_texture;
 };
@@ -477,6 +498,9 @@ gst_gl_color_convert_new (GstGLContext * context)
   gst_video_info_set_format (&convert->out_info, GST_VIDEO_FORMAT_ENCODED, 0,
       0);
 
+  GST_DEBUG_OBJECT (convert,
+      "Created new colorconvert for context %" GST_PTR_FORMAT, context);
+
   return convert;
 }
 
@@ -510,6 +534,11 @@ _reset_gl (GstGLContext * context, GstGLColorConvert * convert)
   if (convert->priv->vertex_buffer) {
     gl->DeleteBuffers (1, &convert->priv->vertex_buffer);
     convert->priv->vertex_buffer = 0;
+  }
+
+  if (convert->priv->vbo_indices) {
+    gl->DeleteBuffers (1, &convert->priv->vbo_indices);
+    convert->priv->vbo_indices = 0;
   }
 }
 
@@ -550,7 +579,7 @@ _gst_gl_color_convert_set_caps_unlocked (GstGLColorConvert * convert,
     GstCaps * in_caps, GstCaps * out_caps)
 {
   GstVideoInfo in_info, out_info;
-  GstCapsFeatures *in_features, *out_features, *gl_features;
+  GstCapsFeatures *in_features, *out_features;
 
   g_return_val_if_fail (convert != NULL, FALSE);
   g_return_val_if_fail (in_caps, FALSE);
@@ -571,18 +600,15 @@ _gst_gl_color_convert_set_caps_unlocked (GstGLColorConvert * convert,
   g_return_val_if_fail (GST_VIDEO_INFO_FORMAT (&out_info) !=
       GST_VIDEO_FORMAT_ENCODED, FALSE);
 
-  gl_features =
-      gst_caps_features_from_string (GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
   in_features = gst_caps_get_features (in_caps, 0);
   out_features = gst_caps_get_features (out_caps, 0);
 
-  if (!gst_caps_features_is_equal (in_features, gl_features)
-      || !gst_caps_features_is_equal (out_features, gl_features)) {
-    gst_caps_features_free (gl_features);
+  if (!gst_caps_features_contains (in_features,
+          GST_CAPS_FEATURE_MEMORY_GL_MEMORY)
+      || !gst_caps_features_contains (out_features,
+          GST_CAPS_FEATURE_MEMORY_GL_MEMORY)) {
     return FALSE;
   }
-
-  gst_caps_features_free (gl_features);
 
   if (gst_video_info_is_equal (&convert->in_info, &in_info) &&
       gst_video_info_is_equal (&convert->out_info, &out_info))
@@ -599,8 +625,8 @@ _gst_gl_color_convert_set_caps_unlocked (GstGLColorConvert * convert,
 /**
  * gst_gl_color_convert_set_caps:
  * @convert: a #GstGLColorConvert
- * @in_info: input #GstVideoInfo
- * @out_info: output #GstVideoInfo
+ * @in_caps: input #GstCaps
+ * @out_caps: output #GstCaps
  *
  * Initializes @convert with the information required for conversion.
  */
@@ -615,6 +641,64 @@ gst_gl_color_convert_set_caps (GstGLColorConvert * convert,
   GST_OBJECT_UNLOCK (convert);
 
   return ret;
+}
+
+/* copies the given caps */
+static GstCaps *
+gst_gl_color_convert_caps_remove_format_info (GstCaps * caps)
+{
+  GstStructure *st;
+  GstCapsFeatures *f;
+  gint i, n;
+  GstCaps *res;
+
+  res = gst_caps_new_empty ();
+
+  n = gst_caps_get_size (caps);
+  for (i = 0; i < n; i++) {
+    st = gst_caps_get_structure (caps, i);
+    f = gst_caps_get_features (caps, i);
+
+    /* If this is already expressed by the existing caps
+     * skip this structure */
+    if (i > 0 && gst_caps_is_subset_structure_full (res, st, f))
+      continue;
+
+    st = gst_structure_copy (st);
+    gst_structure_remove_fields (st, "format", "colorimetry", "chroma-site",
+        NULL);
+
+    gst_caps_append_structure_full (res, st,
+        gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL));
+  }
+
+  return res;
+}
+
+GstCaps *
+gst_gl_color_convert_transform_caps (GstGLContext * convert,
+    GstPadDirection direction, GstCaps * caps, GstCaps * filter)
+{
+  GstCaps *templ, *result;
+
+  templ =
+      gst_caps_from_string (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
+      (GST_CAPS_FEATURE_MEMORY_GL_MEMORY, GST_GL_COLOR_CONVERT_FORMATS));
+
+  caps = gst_gl_color_convert_caps_remove_format_info (caps);
+  result = gst_caps_intersect (caps, templ);
+  gst_caps_unref (caps);
+  gst_caps_unref (templ);
+
+  if (filter) {
+    GstCaps *tmp;
+
+    tmp = gst_caps_intersect_full (filter, result, GST_CAPS_INTERSECT_FIRST);
+    gst_caps_unref (result);
+    result = tmp;
+  }
+
+  return result;
 }
 
 /**
@@ -812,84 +896,111 @@ _YUV_to_RGB (GstGLColorConvert * convert)
   GstVideoFormat out_format = GST_VIDEO_INFO_FORMAT (&convert->out_info);
   const gchar *out_format_str = gst_video_format_to_string (out_format);
   gchar *pixel_order = _RGB_pixel_order ("rgba", out_format_str);
-#if GST_GL_HAVE_PLATFORM_EAGL
-  gboolean texture_rg = FALSE;
-#else
   gboolean texture_rg =
       gst_gl_context_check_feature (convert->context, "GL_EXT_texture_rg")
-      || gst_gl_context_check_feature (convert->context, "GL_ARB_texture_rg");
+      || gst_gl_context_check_gl_version (convert->context, GST_GL_API_GLES2, 3,
+      0)
+      || gst_gl_context_check_feature (convert->context, "GL_ARB_texture_rg")
+      || gst_gl_context_check_gl_version (convert->context, GST_GL_API_OPENGL3,
+      3, 0);
+  gboolean apple_ycbcr = gst_gl_context_check_feature (convert->context,
+      "GL_APPLE_ycbcr_422");
+  gboolean in_tex_rectangular = FALSE;
+
+#if GST_GL_HAVE_OPENGL
+  GstMemory *memory = gst_buffer_peek_memory (convert->inbuf, 0);
+  if (gst_is_gl_memory (memory) && (USING_OPENGL (convert->context)
+          || USING_OPENGL3 (convert->context))) {
+    in_tex_rectangular =
+        ((GstGLMemory *) memory)->tex_target == GL_TEXTURE_RECTANGLE;
+  }
 #endif
 
   info->out_n_textures = 1;
 
-  switch (GST_VIDEO_INFO_FORMAT (&convert->in_info)) {
-    case GST_VIDEO_FORMAT_AYUV:
-      info->frag_prog = g_strdup_printf (frag_AYUV_to_RGB, pixel_order[0],
-          pixel_order[1], pixel_order[2], pixel_order[3]);
-      info->in_n_textures = 1;
-      info->shader_tex_names[0] = "tex";
-      break;
-    case GST_VIDEO_FORMAT_I420:
-    case GST_VIDEO_FORMAT_Y444:
-    case GST_VIDEO_FORMAT_Y42B:
-    case GST_VIDEO_FORMAT_Y41B:
-      info->frag_prog = g_strdup_printf (frag_PLANAR_YUV_to_RGB, pixel_order[0],
-          pixel_order[1], pixel_order[2], pixel_order[3]);
-      info->in_n_textures = 3;
-      info->shader_tex_names[0] = "Ytex";
-      info->shader_tex_names[1] = "Utex";
-      info->shader_tex_names[2] = "Vtex";
-      break;
-    case GST_VIDEO_FORMAT_YV12:
-      info->frag_prog = g_strdup_printf (frag_PLANAR_YUV_to_RGB, pixel_order[0],
-          pixel_order[1], pixel_order[2], pixel_order[3]);
-      info->in_n_textures = 3;
-      info->shader_tex_names[0] = "Ytex";
-      info->shader_tex_names[1] = "Vtex";
-      info->shader_tex_names[2] = "Utex";
-      break;
-    case GST_VIDEO_FORMAT_YUY2:
-    {
-      char uv_val = texture_rg ? 'g' : 'a';
-      info->frag_prog = g_strdup_printf (frag_YUY2_UYVY_to_RGB, 'r', uv_val,
-          uv_val, 'g', 'a', pixel_order[0], pixel_order[1], pixel_order[2],
-          pixel_order[3]);
-      info->in_n_textures = 1;
-      info->shader_tex_names[0] = "Ytex";
-      break;
+  if (in_tex_rectangular && apple_ycbcr
+      && gst_buffer_n_memory (convert->inbuf) == 1) {
+    /* FIXME: We should probably also check if tex_target actually is using
+     * the Apple YCbCr422 extension. It could also be a normal UYVY texture
+     * with RB or Lum/Alpha
+     */
+    info->frag_prog =
+        g_strdup_printf (frag_APPLE_YUV_TO_RGB, pixel_order[0], pixel_order[1],
+        pixel_order[2], pixel_order[3]);
+    info->in_n_textures = 1;
+    info->shader_tex_names[0] = "tex";
+  } else {
+    switch (GST_VIDEO_INFO_FORMAT (&convert->in_info)) {
+      case GST_VIDEO_FORMAT_AYUV:
+        info->frag_prog = g_strdup_printf (frag_AYUV_to_RGB, pixel_order[0],
+            pixel_order[1], pixel_order[2], pixel_order[3]);
+        info->in_n_textures = 1;
+        info->shader_tex_names[0] = "tex";
+        break;
+      case GST_VIDEO_FORMAT_I420:
+      case GST_VIDEO_FORMAT_Y444:
+      case GST_VIDEO_FORMAT_Y42B:
+      case GST_VIDEO_FORMAT_Y41B:
+        info->frag_prog =
+            g_strdup_printf (frag_PLANAR_YUV_to_RGB, pixel_order[0],
+            pixel_order[1], pixel_order[2], pixel_order[3]);
+        info->in_n_textures = 3;
+        info->shader_tex_names[0] = "Ytex";
+        info->shader_tex_names[1] = "Utex";
+        info->shader_tex_names[2] = "Vtex";
+        break;
+      case GST_VIDEO_FORMAT_YV12:
+        info->frag_prog =
+            g_strdup_printf (frag_PLANAR_YUV_to_RGB, pixel_order[0],
+            pixel_order[1], pixel_order[2], pixel_order[3]);
+        info->in_n_textures = 3;
+        info->shader_tex_names[0] = "Ytex";
+        info->shader_tex_names[1] = "Vtex";
+        info->shader_tex_names[2] = "Utex";
+        break;
+      case GST_VIDEO_FORMAT_YUY2:
+      {
+        char uv_val = texture_rg ? 'g' : 'a';
+        info->frag_prog = g_strdup_printf (frag_YUY2_UYVY_to_RGB, 'r', uv_val,
+            uv_val, 'g', 'a', pixel_order[0], pixel_order[1], pixel_order[2],
+            pixel_order[3]);
+        info->in_n_textures = 1;
+        info->shader_tex_names[0] = "Ytex";
+        break;
+      }
+      case GST_VIDEO_FORMAT_NV12:
+      {
+        char val2 = texture_rg ? 'g' : 'a';
+        info->frag_prog = g_strdup_printf (frag_NV12_NV21_to_RGB, 'r', val2,
+            pixel_order[0], pixel_order[1], pixel_order[2], pixel_order[3]);
+        info->in_n_textures = 2;
+        info->shader_tex_names[0] = "Ytex";
+        info->shader_tex_names[1] = "UVtex";
+        break;
+      }
+      case GST_VIDEO_FORMAT_NV21:
+      {
+        char val2 = texture_rg ? 'g' : 'a';
+        info->frag_prog = g_strdup_printf (frag_NV12_NV21_to_RGB, val2, 'r',
+            pixel_order[0], pixel_order[1], pixel_order[2], pixel_order[3]);
+        info->in_n_textures = 2;
+        info->shader_tex_names[0] = "Ytex";
+        info->shader_tex_names[1] = "UVtex";
+        break;
+      }
+      case GST_VIDEO_FORMAT_UYVY:
+      {
+        char y_val = texture_rg ? 'g' : 'a';
+        info->frag_prog = g_strdup_printf (frag_YUY2_UYVY_to_RGB, y_val, 'g',
+            'g', 'r', 'b', pixel_order[0], pixel_order[1], pixel_order[2],
+            pixel_order[3]);
+        info->in_n_textures = 1;
+        info->shader_tex_names[0] = "Ytex";
+        break;
+      }
+      default:
+        break;
     }
-    case GST_VIDEO_FORMAT_NV12:
-    {
-      char val2 = texture_rg ? 'g' : 'a';
-      info->frag_prog = g_strdup_printf (frag_NV12_NV21_to_RGB, 'r', val2,
-          pixel_order[0], pixel_order[1], pixel_order[2], pixel_order[3]);
-      info->in_n_textures = 2;
-      info->shader_tex_names[0] = "Ytex";
-      info->shader_tex_names[1] = "UVtex";
-      break;
-    }
-    case GST_VIDEO_FORMAT_NV21:
-    {
-      char val2 = texture_rg ? 'g' : 'a';
-      info->frag_prog = g_strdup_printf (frag_NV12_NV21_to_RGB, val2, 'r',
-          pixel_order[0], pixel_order[1], pixel_order[2], pixel_order[3]);
-      info->in_n_textures = 2;
-      info->shader_tex_names[0] = "Ytex";
-      info->shader_tex_names[1] = "UVtex";
-      break;
-    }
-    case GST_VIDEO_FORMAT_UYVY:
-    {
-      char y_val = texture_rg ? 'g' : 'a';
-      info->frag_prog = g_strdup_printf (frag_YUY2_UYVY_to_RGB, y_val, 'g',
-          'g', 'r', 'b', pixel_order[0], pixel_order[1], pixel_order[2],
-          pixel_order[3]);
-      info->in_n_textures = 1;
-      info->shader_tex_names[0] = "Ytex";
-      break;
-    }
-    default:
-      break;
   }
 
   if (gst_video_colorimetry_matches (&convert->in_info.colorimetry,
@@ -1023,13 +1134,13 @@ _GRAY_to_RGB (GstGLColorConvert * convert)
   GstVideoFormat out_format = GST_VIDEO_INFO_FORMAT (&convert->out_info);
   const gchar *out_format_str = gst_video_format_to_string (out_format);
   gchar *pixel_order = _RGB_pixel_order ("rgba", out_format_str);
-#if GST_GL_HAVE_PLATFORM_EAGL
-  gboolean texture_rg = FALSE;
-#else
   gboolean texture_rg =
       gst_gl_context_check_feature (convert->context, "GL_EXT_texture_rg")
-      || gst_gl_context_check_feature (convert->context, "GL_ARB_texture_rg");
-#endif
+      || gst_gl_context_check_gl_version (convert->context, GST_GL_API_GLES2, 3,
+      0)
+      || gst_gl_context_check_feature (convert->context, "GL_ARB_texture_rg")
+      || gst_gl_context_check_gl_version (convert->context, GST_GL_API_OPENGL3,
+      3, 0);
 
   info->in_n_textures = 1;
   info->out_n_textures = 1;
@@ -1233,6 +1344,15 @@ _init_convert (GstGLColorConvert * convert)
     gl->BindBuffer (GL_ARRAY_BUFFER, 0);
   }
 
+  if (!convert->priv->vbo_indices) {
+    gl->GenBuffers (1, &convert->priv->vbo_indices);
+    gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, convert->priv->vbo_indices);
+    gl->BufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (indices), indices,
+        GL_STATIC_DRAW);
+    gl->BindBuffer (GL_ARRAY_BUFFER, 0);
+  }
+
+
   gl->BindTexture (GL_TEXTURE_2D, 0);
 
   convert->initted = TRUE;
@@ -1364,7 +1484,7 @@ _do_convert (GstGLContext * context, GstGLColorConvert * convert)
   }
 
   convert->outbuf = gst_buffer_new ();
-  if (!gst_gl_memory_setup_buffer (convert->context, &convert->out_info,
+  if (!gst_gl_memory_setup_buffer (convert->context, NULL, &convert->out_info,
           NULL, convert->outbuf)) {
     convert->priv->result = FALSE;
     return;
@@ -1414,7 +1534,8 @@ _do_convert (GstGLContext * context, GstGLColorConvert * convert)
 
       if (!convert->priv->out_tex[j])
         convert->priv->out_tex[j] =
-            (GstGLMemory *) gst_gl_memory_alloc (context, &temp_info, 0, NULL);
+            (GstGLMemory *) gst_gl_memory_alloc (context, NULL, &temp_info, 0,
+            NULL);
     } else {
       convert->priv->out_tex[j] = out_tex;
     }
@@ -1496,6 +1617,14 @@ out:
     convert->outbuf = NULL;
   }
 
+  if (convert->outbuf) {
+    GstGLSyncMeta *sync_meta =
+        gst_buffer_add_gl_sync_meta (convert->context, convert->outbuf);
+
+    if (sync_meta)
+      gst_gl_sync_meta_set_sync_point (sync_meta, convert->context);
+  }
+
   convert->priv->result = res;
   return;
 }
@@ -1509,8 +1638,6 @@ _do_convert_draw (GstGLContext * context, GstGLColorConvert * convert)
   gint i;
 
   GLint viewport_dim[4];
-
-  GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
 
   GLenum multipleRT[] = {
     GL_COLOR_ATTACHMENT0,
@@ -1543,9 +1670,6 @@ _do_convert_draw (GstGLContext * context, GstGLColorConvert * convert)
 
   gl->Viewport (0, 0, out_width, out_height);
 
-  gl->ClearColor (0.0, 0.0, 0.0, 0.0);
-  gl->Clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
   gst_gl_shader_use (convert->shader);
 
   if (gl->BindVertexArray)
@@ -1555,14 +1679,15 @@ _do_convert_draw (GstGLContext * context, GstGLColorConvert * convert)
 
   for (i = c_info->in_n_textures - 1; i >= 0; i--) {
     gchar *scale_name = g_strdup_printf ("tex_scale%u", i);
+    GstGLMemory *m = convert->priv->in_tex[i];
+    guint tex_target = m->tex_target;
 
     gl->ActiveTexture (GL_TEXTURE0 + i);
-    gl->BindTexture (GL_TEXTURE_2D, convert->priv->in_tex[i]->tex_id);
-
-    gl->TexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    gl->TexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    gl->TexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl->TexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl->BindTexture (tex_target, convert->priv->in_tex[i]->tex_id);
+    gl->TexParameteri (tex_target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl->TexParameteri (tex_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl->TexParameteri (tex_target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->TexParameteri (tex_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     gst_gl_shader_set_uniform_2fv (convert->shader, scale_name, 1,
         convert->priv->in_tex[i]->tex_scaling);
@@ -1570,7 +1695,8 @@ _do_convert_draw (GstGLContext * context, GstGLColorConvert * convert)
     g_free (scale_name);
   }
 
-  gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, convert->priv->vbo_indices);
+  gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
   if (gl->BindVertexArray)
     gl->BindVertexArray (0);
@@ -1579,6 +1705,8 @@ _do_convert_draw (GstGLContext * context, GstGLColorConvert * convert)
 
   if (gl->DrawBuffer)
     gl->DrawBuffer (GL_NONE);
+
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0);
 
   /* we are done with the shader */
   gst_gl_context_clear_shader (context);

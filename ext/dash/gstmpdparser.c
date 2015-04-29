@@ -1329,6 +1329,9 @@ gst_mpdparser_parse_mult_seg_base_type_ext (GstMultSegmentBaseType ** pointer,
     return;
   }
 
+  mult_seg_base_type->duration = 0;
+  mult_seg_base_type->startNumber = 1;
+
   /* Inherit attribute values from parent */
   if (parent) {
     mult_seg_base_type->duration = parent->duration;
@@ -1344,6 +1347,7 @@ gst_mpdparser_parse_mult_seg_base_type_ext (GstMultSegmentBaseType ** pointer,
           &intval)) {
     mult_seg_base_type->duration = intval;
   }
+
   if (gst_mpdparser_get_xml_prop_unsigned_integer (a_node, "startNumber", 1,
           &intval)) {
     mult_seg_base_type->startNumber = intval;
@@ -1919,11 +1923,11 @@ gst_mpdparser_representation_get_mimetype (GstAdaptationSetNode * adapt_set,
     mime = adapt_set->RepresentationBase->mimeType;
   }
 
-  if (strncmp_ext (mime, "audio"))
+  if (strncmp_ext (mime, "audio") == 0)
     return GST_STREAM_AUDIO;
-  if (strncmp_ext (mime, "video"))
+  if (strncmp_ext (mime, "video") == 0)
     return GST_STREAM_VIDEO;
-  if (strncmp_ext (mime, "application"))
+  if (strncmp_ext (mime, "application") == 0)
     return GST_STREAM_APPLICATION;
 
   return GST_STREAM_UNKNOWN;
@@ -2955,7 +2959,7 @@ gst_mpdparser_get_chunk_by_index (GstMpdClient * client, guint indexStream,
     segment->duration = duration;
     segment->SegmentURL = NULL;
 
-    if (segment->start_time > stream_period->duration) {
+    if (segment->start_time >= stream_period->duration) {
       return FALSE;
     }
   }
@@ -3141,19 +3145,31 @@ gst_mpd_client_setup_representation (GstMpdClient * client,
         return FALSE;
       }
     } else {
+      GstMultSegmentBaseType *mult_seg =
+          stream->cur_seg_template->MultSegBaseType;
       /* build segment list */
-      i = stream->cur_seg_template->MultSegBaseType->startNumber;
+      i = mult_seg->startNumber;
       start = 0;
       start_time = PeriodStart;
 
       GST_LOG ("Building media segment list using this template: %s",
           stream->cur_seg_template->media);
-      if (stream->cur_seg_template->MultSegBaseType->SegmentTimeline) {
+      stream->presentationTimeOffset =
+          mult_seg->SegBaseType->presentationTimeOffset * GST_SECOND;
+
+      /* Avoid dividing by zero */
+      if (mult_seg->SegBaseType->timescale)
+        stream->presentationTimeOffset /= mult_seg->SegBaseType->timescale;
+
+      GST_LOG ("Setting stream's presentation time offset to %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (stream->presentationTimeOffset));
+
+      if (mult_seg->SegmentTimeline) {
         GstSegmentTimelineNode *timeline;
         GstSNode *S;
         GList *list;
 
-        timeline = stream->cur_seg_template->MultSegBaseType->SegmentTimeline;
+        timeline = mult_seg->SegmentTimeline;
         gst_mpdparser_init_active_stream_segments (stream);
         for (list = g_queue_peek_head_link (&timeline->S); list;
             list = g_list_next (list)) {
@@ -3163,8 +3179,7 @@ gst_mpd_client_setup_representation (GstMpdClient * client,
           GST_LOG ("Processing S node: d=%" G_GUINT64_FORMAT " r=%u t=%"
               G_GUINT64_FORMAT, S->d, S->r, S->t);
           duration = S->d * GST_SECOND;
-          timescale =
-              stream->cur_seg_template->MultSegBaseType->SegBaseType->timescale;
+          timescale = mult_seg->SegBaseType->timescale;
           if (timescale > 1)
             duration /= timescale;
           if (S->t > 0) {
@@ -3584,6 +3599,20 @@ gst_mpd_client_get_next_fragment_timestamp (GstMpdClient * client,
   return TRUE;
 }
 
+GstClockTime
+gst_mpd_parser_get_stream_presentation_offset (GstMpdClient * client,
+    guint stream_idx)
+{
+  GstActiveStream *stream = NULL;
+
+  g_return_val_if_fail (client != NULL, FALSE);
+  g_return_val_if_fail (client->active_streams != NULL, FALSE);
+  stream = g_list_nth_data (client->active_streams, stream_idx);
+  g_return_val_if_fail (stream != NULL, FALSE);
+
+  return stream->presentationTimeOffset;
+}
+
 gboolean
 gst_mpd_client_get_next_fragment (GstMpdClient * client,
     guint indexStream, GstMediaFragmentInfo * fragment)
@@ -3699,7 +3728,7 @@ gst_mpd_client_update_segment (GstMpdClient * client, GstActiveStream * stream,
   guint segment_idx;
 
   segment_idx = gst_mpd_client_get_segment_index (stream);
-  GST_DEBUG ("Looking for fragment sequence chunk %d", segment_idx);
+  GST_DEBUG ("Looking for fragment sequence chunk %d", segment_idx + update);
 
   gst_mpd_client_set_segment_index (stream, segment_idx + update);
 

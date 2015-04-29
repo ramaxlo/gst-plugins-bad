@@ -44,76 +44,10 @@ GST_DEBUG_CATEGORY_STATIC (gst_gl_context_cocoa_debug);
 G_DEFINE_TYPE_WITH_CODE (GstGLContextCocoa, gst_gl_context_cocoa,
     GST_GL_TYPE_CONTEXT, GST_DEBUG_CATEGORY_INIT (gst_gl_context_cocoa_debug, "glcontext_cocoa", 0, "Cocoa GL Context"); );
 
-/* Define this if the GLib patch from
- * https://bugzilla.gnome.org/show_bug.cgi?id=741450
- * is used
- */
-#ifndef GSTREAMER_GLIB_COCOA_NSAPPLICATION
-
-static GMutex nsapp_lock;
-static GCond nsapp_cond;
-
-static gboolean
-gst_gl_window_cocoa_init_nsapp (gpointer data)
-{
-  NSAutoreleasePool *pool = nil;
-
-  g_mutex_lock (&nsapp_lock);
-
-  pool = [[NSAutoreleasePool alloc] init];
-
-  /* The sharedApplication class method initializes
-   * the display environment and connects your program
-   * to the window server and the display server
-   */
-
-  /* TODO: so consider to create GstGLDisplayCocoa
-   * in gst/gl/cocoa/gstgldisplay_cocoa.h/c
-   */
-
-  /* has to be called in the main thread */
-  [NSApplication sharedApplication];
-
-  GST_DEBUG ("NSApp initialized from a GTimeoutSource");
-
-  [pool release];
-
-  g_cond_signal (&nsapp_cond);
-  g_mutex_unlock (&nsapp_lock);
-
-  return FALSE;
-}
-
-static gboolean
-gst_gl_window_cocoa_nsapp_iteration (gpointer data)
-{
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-
-  NSEvent *event = nil;
-
-  if ([NSThread isMainThread]) {
-
-    while ((event = ([NSApp nextEventMatchingMask:NSAnyEventMask
-      untilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]
-      inMode:NSDefaultRunLoopMode dequeue:YES])) != nil) {
-
-      [NSApp sendEvent:event];
-    }
-  }
-
-  [pool release];
-
-  return TRUE;
-}
-#endif
-
 static void
 gst_gl_context_cocoa_class_init (GstGLContextCocoaClass * klass)
 {
   GstGLContextClass *context_class = (GstGLContextClass *) klass;
-#ifndef GSTREAMER_GLIB_COCOA_NSAPPLICATION
-  NSAutoreleasePool* pool = nil;
-#endif
 
   g_type_class_add_private (klass, sizeof (GstGLContextCocoaPrivate));
 
@@ -128,72 +62,6 @@ gst_gl_context_cocoa_class_init (GstGLContextCocoaClass * klass)
       GST_DEBUG_FUNCPTR (gst_gl_context_cocoa_get_gl_api);
   context_class->get_gl_platform =
       GST_DEBUG_FUNCPTR (gst_gl_context_cocoa_get_gl_platform);
-
-#ifndef GSTREAMER_GLIB_COCOA_NSAPPLICATION
-  pool = [[NSAutoreleasePool alloc] init];
-
-  /* [NSApplication sharedApplication] will usually be
-   * called in your application so it's not necessary
-   * to do that the following. Except for debugging 
-   * purpose like when using gst-launch.
-   * So here we handle the two cases where the first
-   * GstGLContext is either created in the main thread
-   * or from another thread like a streaming thread
-   */
-
-  if ([NSThread isMainThread]) {
-    /* In the main thread so just do the call now */
-
-    /* The sharedApplication class method initializes
-     * the display environment and connects your program
-     * to the window server and the display server
-     */
-
-    /* TODO: so consider to create GstGLDisplayCocoa
-     * in gst/gl/cocoa/gstgldisplay_cocoa.h/c
-     */
-
-    /* has to be called in the main thread */
-    [NSApplication sharedApplication];
-
-    GST_DEBUG ("NSApp initialized");
-  } else {
-    /* Not in the main thread, assume there is a
-     * glib main loop running this is for debugging
-     * purposes so that's ok to let us a chance
-     */
-    GMainContext *context;
-    gboolean is_loop_running = FALSE;
-    gint64 end_time = 0;
-
-    context = g_main_context_default ();
-
-    if (g_main_context_is_owner (context)) {
-      /* At the thread running the default GLib main context but
-       * not the Cocoa main thread
-       * We can't do anything here
-       */
-    } else if (g_main_context_acquire (context)) {
-      /* No main loop running on the default main context,
-       * we can't do anything here */
-      g_main_context_release (context);
-    } else {
-      /* Main loop running on the default main context but it
-       * is not running in this thread */
-      g_mutex_lock (&nsapp_lock);
-      g_idle_add_full (G_PRIORITY_HIGH, gst_gl_window_cocoa_init_nsapp, NULL, NULL);
-      end_time = g_get_monotonic_time () + 500 * 1000;
-      is_loop_running = g_cond_wait_until (&nsapp_cond, &nsapp_lock, end_time);
-      g_mutex_unlock (&nsapp_lock);
-
-      if (!is_loop_running) {
-        GST_WARNING ("no mainloop running");
-      }
-    }
-  }
-
-  [pool release];
-#endif
 }
 
 static void
@@ -229,8 +97,6 @@ static struct pixel_attr pixel_attrs[] = {
   {kCGLPFAAccumSize, "Accum Size"},
   {kCGLPFAMinimumPolicy, "Minimum Policy"},
   {kCGLPFAMaximumPolicy, "Maximum Policy"},
-//  {kCGLPFAOffScreen, "Off Screen"},
-//  {kCGLPFAFullScreen, "Full Screen"},
   {kCGLPFASampleBuffers, "Sample Buffers"},
   {kCGLPFASamples, "Samples"},
   {kCGLPFAAuxDepthStencil, "Aux Depth Stencil"},
@@ -238,23 +104,33 @@ static struct pixel_attr pixel_attrs[] = {
   {kCGLPFAMultisample, "Multisample"},
   {kCGLPFASupersample, "Supersample"},
   {kCGLPFARendererID, "Renderer ID"},
-  {kCGLPFASingleRenderer, "Single Renderer"},
   {kCGLPFANoRecovery, "No Recovery"},
   {kCGLPFAAccelerated, "Accelerated"},
   {kCGLPFAClosestPolicy, "Closest Policy"},
-//  {kCGLPFARobust, "Robust"},
   {kCGLPFABackingStore, "Backing Store"},
-//  {kCGLPFAMPSafe, "MP Safe"},
-  {kCGLPFAWindow, "Window"},
-//  {kCGLPFAMultiScreen, "Multi Screen"},
-  {kCGLPFACompliant, "Compliant"},
   {kCGLPFADisplayMask, "Display Mask"},
-//  {kCGLPFAPBuffer, "PBuffer"},
-  {kCGLPFARemotePBuffer, "Remote PBuffer"},
   {kCGLPFAAllowOfflineRenderers, "Allow Offline Renderers"},
   {kCGLPFAAcceleratedCompute, "Accelerated Compute"},
   {kCGLPFAOpenGLProfile, "OpenGL Profile"},
   {kCGLPFAVirtualScreenCount, "Virtual Screen Count"},
+#if MAC_OS_X_VERSION_MAX_ALLOWED < 1090
+  {kCGLPFACompliant, "Compliant"},
+  {kCGLPFARemotePBuffer, "Remote PBuffer"},
+  {kCGLPFASingleRenderer, "Single Renderer"},
+  {kCGLPFAWindow, "Window"},
+#endif
+#if MAC_OS_X_VERSION_MAX_ALLOWED < 1070
+//  {kCGLPFAOffScreen, "Off Screen"},
+//  {kCGLPFAPBuffer, "PBuffer"},
+#endif
+#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
+//  {kCGLPFAFullScreen, "Full Screen"},
+#endif
+#if MAC_OS_X_VERSION_MAX_ALLOWED < 1050
+//  {kCGLPFAMPSafe, "MP Safe"},
+//  {kCGLPFAMultiScreen, "Multi Screen"},
+//  {kCGLPFARobust, "Robust"},
+#endif
 };
 
 void
@@ -290,10 +166,16 @@ gst_gl_context_cocoa_create_context (GstGLContext *context, GstGLAPI gl_api,
   GstGLWindow *window = gst_gl_context_get_window (context);
   GstGLWindowCocoa *window_cocoa = GST_GL_WINDOW_COCOA (window);
   const GLint swapInterval = 1;
-
-#ifndef GSTREAMER_GLIB_COCOA_NSAPPLICATION
-  priv->source_id = g_timeout_add (200, gst_gl_window_cocoa_nsapp_iteration, NULL);
-#endif
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  CGLPixelFormatObj fmt = NULL;
+  CGLContextObj glContext;
+  CGLPixelFormatAttribute attribs[] = {
+    kCGLPFADoubleBuffer,
+    kCGLPFAAccumSize, 32,
+    0
+  };
+  CGLError ret;
+  gint npix;
 
   priv->gl_context = nil;
   if (other_context)
@@ -301,73 +183,36 @@ gst_gl_context_cocoa_create_context (GstGLContext *context, GstGLAPI gl_api,
   else
     priv->external_gl_context = NULL;
 
-  dispatch_sync (dispatch_get_main_queue (), ^{
-    NSAutoreleasePool *pool;
-    CGLPixelFormatObj fmt = NULL;
-    GstGLNSView *glView = NULL;
-    GstGLCAOpenGLLayer *layer;
-    CGLContextObj glContext;
-    CGLPixelFormatAttribute attribs[] = {
-      kCGLPFADoubleBuffer,
-      kCGLPFAAccumSize, 32,
-      0
-    };
-    CGLError ret;
-    NSRect rect;
-    NSWindow *window_handle;
-    gint npix;
+  if (priv->external_gl_context) {
+    fmt = CGLGetPixelFormat (priv->external_gl_context);
+  }
 
-    pool = [[NSAutoreleasePool alloc] init];
-
-    rect.origin.x = 0;
-    rect.origin.y = 0;
-    rect.size.width = 320;
-    rect.size.height = 240;
-
-    gst_gl_window_cocoa_create_window (window_cocoa, rect);
-    window_handle = (NSWindow *) gst_gl_window_get_window_handle (window);
-
-    if (priv->external_gl_context) {
-      fmt = CGLGetPixelFormat (priv->external_gl_context);
-    }
-
-    if (!fmt) {
-      ret = CGLChoosePixelFormat (attribs, &fmt, &npix);
-      if (ret != kCGLNoError) {
-        gst_object_unref (window);
-        g_set_error (error, GST_GL_CONTEXT_ERROR,
-            GST_GL_CONTEXT_ERROR_WRONG_CONFIG, "cannot choose a pixel format: %s", CGLErrorString (ret));
-        return;
-      }
-    }
-
-    gst_gl_context_cocoa_dump_pixel_format (fmt);
-
-    ret = CGLCreateContext (fmt, priv->external_gl_context, &glContext);
+  if (!fmt) {
+    ret = CGLChoosePixelFormat (attribs, &fmt, &npix);
     if (ret != kCGLNoError) {
-      g_set_error (error, GST_GL_CONTEXT_ERROR, GST_GL_CONTEXT_ERROR_CREATE_CONTEXT,
-          "failed to create context: %s", CGLErrorString (ret));
-      gst_object_unref (window);
-      return;
+      g_set_error (error, GST_GL_CONTEXT_ERROR,
+          GST_GL_CONTEXT_ERROR_WRONG_CONFIG, "cannot choose a pixel format: %s", CGLErrorString (ret));
+      goto error;
     }
+  }
 
-    context_cocoa->priv->pixel_format = fmt;
-    context_cocoa->priv->gl_context = glContext;
+  gst_gl_context_cocoa_dump_pixel_format (fmt);
 
-    layer = [[GstGLCAOpenGLLayer alloc] initWithGstGLContext:context_cocoa];
-    glView = [[GstGLNSView alloc] initWithFrameLayer:window_cocoa rect:rect layer:layer];
+  ret = CGLCreateContext (fmt, priv->external_gl_context, &glContext);
+  if (ret != kCGLNoError) {
+    g_set_error (error, GST_GL_CONTEXT_ERROR, GST_GL_CONTEXT_ERROR_CREATE_CONTEXT,
+        "failed to create context: %s", CGLErrorString (ret));
+    goto error;
+  }
 
-    [window_handle setContentView:glView];
+  context_cocoa->priv->pixel_format = fmt;
+  context_cocoa->priv->gl_context = glContext;
 
-    [pool release];
-  });
+  _invoke_on_main ((GstGLWindowCB) gst_gl_window_cocoa_create_window,
+      window_cocoa);
 
   if (!context_cocoa->priv->gl_context) {
-#ifndef GSTREAMER_GLIB_COCOA_NSAPPLICATION
-    g_source_remove (priv->source_id);
-    priv->source_id = 0;
-#endif
-    return FALSE;
+    goto error;
   }
 
   GST_INFO_OBJECT (context, "GL context created: %p", context_cocoa->priv->gl_context);
@@ -380,21 +225,20 @@ gst_gl_context_cocoa_create_context (GstGLContext *context, GstGLAPI gl_api,
   CGLSetParameter (context_cocoa->priv->gl_context, kCGLCPSwapInterval, &swapInterval);
 
   gst_object_unref (window);
+  [pool release];
 
   return TRUE;
+
+error:
+  gst_object_unref (window);
+  [pool release];
+  return FALSE;
 }
 
 static void
 gst_gl_context_cocoa_destroy_context (GstGLContext *context)
 {
-  GstGLContextCocoa *context_cocoa = GST_GL_CONTEXT_COCOA (context);
-  GstGLContextCocoaPrivate *priv = context_cocoa->priv;
-
   /* FIXME: Need to release context and other things? */
-  if (priv->source_id) {
-    g_source_remove (priv->source_id);
-    priv->source_id = 0;
-  }
 }
 
 static guintptr

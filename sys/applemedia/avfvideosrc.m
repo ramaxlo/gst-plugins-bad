@@ -24,6 +24,9 @@
 #include "avfvideosrc.h"
 
 #import <AVFoundation/AVFoundation.h>
+#if !HAVE_IOS
+#import <AppKit/AppKit.h>
+#endif
 #include <gst/video/video.h>
 #include <gst/gl/gstglcontext.h>
 #include "coremediabuffer.h"
@@ -56,7 +59,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
         "height = " GST_VIDEO_SIZE_RANGE "; "
 
         GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-        (GST_CAPS_FEATURE_META_GST_VIDEO_GL_TEXTURE_UPLOAD_META,
+        (GST_CAPS_FEATURE_MEMORY_GL_MEMORY,
             "RGBA") "; "
 ));
 
@@ -75,14 +78,12 @@ G_DEFINE_TYPE (GstAVFVideoSrc, gst_avf_video_src, GST_TYPE_PUSH_SRC);
 
   gint deviceIndex;
   BOOL doStats;
-#if !HAVE_IOS
-  CGDirectDisplayID displayId;
-#endif
 
   AVCaptureSession *session;
   AVCaptureInput *input;
   AVCaptureVideoDataOutput *output;
   AVCaptureDevice *device;
+  AVCaptureConnection *connection;
   CMClockRef inputClock;
 
   dispatch_queue_t mainQueue;
@@ -92,12 +93,11 @@ G_DEFINE_TYPE (GstAVFVideoSrc, gst_avf_video_src, GST_TYPE_PUSH_SRC);
   BOOL stopRequest;
 
   GstCaps *caps;
+  GstVideoFormat internalFormat;
   GstVideoFormat format;
   gint width, height;
   GstClockTime latency;
   guint64 offset;
-  GstClockTime startAVFTimestamp;
-  GstClockTime startTimestamp;
 
   GstClockTime lastSampling;
   guint count;
@@ -126,6 +126,9 @@ G_DEFINE_TYPE (GstAVFVideoSrc, gst_avf_video_src, GST_TYPE_PUSH_SRC);
 - (BOOL)openDevice;
 - (void)closeDevice;
 - (GstVideoFormat)getGstVideoFormat:(NSNumber *)pixel_format;
+#if !HAVE_IOS
+- (CGDirectDisplayID)getDisplayIdFromDeviceIndex;
+#endif
 - (BOOL)getDeviceCaps:(GstCaps *)result;
 - (BOOL)setDeviceCaps:(GstVideoInfo *)info;
 - (BOOL)getSessionPresetCaps:(GstCaps *)result;
@@ -169,9 +172,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     captureScreenMouseClicks = NO;
     useVideoMeta = NO;
     textureCache = NULL;
-#if !HAVE_IOS
-    displayId = kCGDirectMainDisplay;
-#endif
 
     mainQueue =
         dispatch_queue_create ("org.freedesktop.gstreamer.avfvideosrc.main", NULL);
@@ -200,7 +200,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   NSString *mediaType = AVMediaTypeVideo;
   NSError *err;
 
-  if (deviceIndex == -1) {
+  if (deviceIndex == DEFAULT_DEVICE_INDEX) {
     device = [AVCaptureDevice defaultDeviceWithMediaType:mediaType];
     if (device == nil) {
       GST_ELEMENT_ERROR (element, RESOURCE, NOT_FOUND,
@@ -241,7 +241,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 #if HAVE_IOS
   return NO;
 #else
+  CGDirectDisplayID displayId;
+
   GST_DEBUG_OBJECT (element, "Opening screen input");
+
+  displayId = [self getDisplayIdFromDeviceIndex];
+  if (displayId == 0)
+    return NO;
 
   AVCaptureScreenInput *screenInput =
       [[AVCaptureScreenInput alloc] initWithDisplayID:displayId];
@@ -292,6 +298,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     [session addInput:input];
     [session addOutput:output];
 
+    /* retained by session */
+    connection = [[output connections] firstObject];
+    inputClock = ((AVCaptureInputPort *)connection.inputPorts[0]).clock;
+
     *successPtr = YES;
   });
 
@@ -306,6 +316,9 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
   dispatch_sync (mainQueue, ^{
     g_assert (![session isRunning]);
+
+    connection = nil;
+    inputClock = nil;
 
     [session removeInput:input];
     [session removeOutput:output];
@@ -326,6 +339,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
     if (caps)
       gst_caps_unref (caps);
+    caps = NULL;
   });
 }
 
@@ -367,6 +381,26 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   return gst_format;
 }
 
+#if !HAVE_IOS
+- (CGDirectDisplayID)getDisplayIdFromDeviceIndex
+{
+  NSDictionary *description;
+  NSNumber *displayId;
+  NSArray *screens = [NSScreen screens];
+
+  if (deviceIndex == DEFAULT_DEVICE_INDEX)
+    return kCGDirectMainDisplay;
+  if (deviceIndex >= [screens count]) {
+    GST_ELEMENT_ERROR (element, RESOURCE, NOT_FOUND,
+                        ("Invalid screen capture device index"), (NULL));
+    return 0;
+  }
+  description = [[screens objectAtIndex:deviceIndex] deviceDescription];
+  displayId = [description objectForKey:@"NSScreenNumber"];
+  return [displayId unsignedIntegerValue];
+}
+#endif
+
 - (BOOL)getDeviceCaps:(GstCaps *)result
 {
   NSArray *formats = [device valueForKey:@"formats"];
@@ -398,7 +432,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         if (gst_format == GST_VIDEO_FORMAT_BGRA) {
           GstCaps *rgba_caps = GST_AVF_CAPS_NEW (GST_VIDEO_FORMAT_RGBA, dimensions.width, dimensions.height, fps_n, fps_d);
-          gst_caps_set_features (rgba_caps, 0, gst_caps_features_new (GST_CAPS_FEATURE_META_GST_VIDEO_GL_TEXTURE_UPLOAD_META, NULL));
+          gst_caps_set_features (rgba_caps, 0, gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_GL_MEMORY, NULL));
           gst_caps_append (result, rgba_caps);
         }
       }
@@ -431,7 +465,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
           gdouble max_frame_rate;
 
           [[rate valueForKey:@"maxFrameRate"] getValue:&max_frame_rate];
-          if (abs (framerate - max_frame_rate) < 0.00001) {
+          if (fabs (framerate - max_frame_rate) < 0.00001) {
             NSValue *min_frame_duration, *max_frame_duration;
 
             found_framerate = TRUE;
@@ -440,7 +474,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             [device setValue:min_frame_duration forKey:@"activeVideoMinFrameDuration"];
             @try {
               /* Only available on OSX >= 10.8 and iOS >= 7.0 */
-              [device setValue:max_frame_duration forKey:@"activeVideoMaxFrameDuration"];
+              // Restrict activeVideoMaxFrameDuration to the minimum value so we get a better capture frame rate
+              [device setValue:min_frame_duration forKey:@"activeVideoMaxFrameDuration"];
             } @catch (NSException *exception) {
               if (![[exception name] isEqualToString:NSUndefinedKeyException]) {
                 GST_WARNING ("An unexcepted error occured: %s",
@@ -546,7 +581,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
   if (captureScreen) {
 #if !HAVE_IOS
-    CGRect rect = CGDisplayBounds (displayId);
+    CGRect rect = CGDisplayBounds ([self getDisplayIdFromDeviceIndex]);
     for (NSNumber *pixel_format in pixel_formats) {
       GstVideoFormat gst_format = [self getGstVideoFormat:pixel_format];
       if (gst_format != GST_VIDEO_FORMAT_UNKNOWN)
@@ -591,6 +626,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   width = info.width;
   height = info.height;
   format = info.finfo->format;
+  internalFormat = GST_VIDEO_FORMAT_UNKNOWN;
   latency = gst_util_uint64_scale (GST_SECOND, info.fps_d, info.fps_n);
 
   dispatch_sync (mainQueue, ^{
@@ -630,22 +666,28 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
       }
     }
 
+    internalFormat = format;
     switch (format) {
       case GST_VIDEO_FORMAT_NV12:
         newformat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
         break;
       case GST_VIDEO_FORMAT_UYVY:
-         newformat = kCVPixelFormatType_422YpCbCr8;
+        newformat = kCVPixelFormatType_422YpCbCr8;
         break;
       case GST_VIDEO_FORMAT_YUY2:
-         newformat = kCVPixelFormatType_422YpCbCr8_yuvs;
+        newformat = kCVPixelFormatType_422YpCbCr8_yuvs;
         break;
       case GST_VIDEO_FORMAT_RGBA:
-        /* In order to do RGBA, we negotiate BGRA (since RGBA is not supported
-         * if not in textures) and then we get RGBA textures via
-         * CVOpenGL*TextureCacheCreateTextureFromImage. Computers. */
+#if !HAVE_IOS
+        newformat = kCVPixelFormatType_422YpCbCr8;
+        internalFormat = GST_VIDEO_FORMAT_UYVY;
+#else
+        newformat = kCVPixelFormatType_32BGRA;
+        internalFormat = GST_VIDEO_FORMAT_BGRA;
+#endif
+        break;
       case GST_VIDEO_FORMAT_BGRA:
-         newformat = kCVPixelFormatType_32BGRA;
+        newformat = kCVPixelFormatType_32BGRA;
         break;
       default:
         *successPtr = NO;
@@ -654,15 +696,17 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         return;
     }
 
-    GST_DEBUG_OBJECT(element,
-       "Width: %d Height: %d Format: %" GST_FOURCC_FORMAT,
-       width, height,
-       GST_FOURCC_ARGS (gst_video_format_to_fourcc (format)));
+    GST_INFO_OBJECT(element,
+        "width: %d height: %d format: %s internalFormat: %s", width, height,
+        gst_video_format_to_string (format),
+        gst_video_format_to_string (internalFormat));
 
     output.videoSettings = [NSDictionary
         dictionaryWithObject:[NSNumber numberWithInt:newformat]
         forKey:(NSString*)kCVPixelBufferPixelFormatTypeKey];
 
+    if (caps)
+      gst_caps_unref (caps);
     caps = gst_caps_copy (new_caps);
     [session startRunning];
 
@@ -682,9 +726,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
   offset = 0;
   latency = GST_CLOCK_TIME_NONE;
-  startAVFTimestamp = GST_CLOCK_TIME_NONE;
-  startTimestamp = GST_CLOCK_TIME_NONE;
-  inputClock = nil;
 
   lastSampling = GST_CLOCK_TIME_NONE;
   count = 0;
@@ -702,7 +743,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   bufQueueLock = nil;
   [bufQueue release];
   bufQueue = nil;
-  inputClock = nil;
 
   if (textureCache)
       gst_core_video_texture_cache_free (textureCache);
@@ -716,7 +756,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   BOOL result = NO;
 
   if (GST_QUERY_TYPE (query) == GST_QUERY_LATENCY) {
-    if (device != nil) {
+    if (device != nil && caps != NULL) {
       GstClockTime min_latency, max_latency;
 
       min_latency = max_latency = latency;
@@ -739,19 +779,34 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   useVideoMeta = gst_query_find_allocation_meta (query,
       GST_VIDEO_META_API_TYPE, NULL);
 
-  guint idx;
-  if (gst_query_find_allocation_meta (query,
-        GST_VIDEO_GL_TEXTURE_UPLOAD_META_API_TYPE, &idx)) {
-    GstGLContext *context;
-    const GstStructure *upload_meta_params;
+  /* determine whether we can pass GL textures to downstream element */
+  GstCapsFeatures *features = gst_caps_get_features (caps, 0);
+  if (gst_caps_features_contains (features, GST_CAPS_FEATURE_MEMORY_GL_MEMORY)) {
+    GstGLContext *glContext = NULL;
 
-    gst_query_parse_nth_allocation_meta (query, idx, &upload_meta_params);
-    if (gst_structure_get (upload_meta_params, "gst.gl.GstGLContext",
-          GST_GL_TYPE_CONTEXT, &context, NULL) && context) {
-      textureCache = gst_core_video_texture_cache_new (context);
-      gst_object_unref (context);
+    /* get GL context from downstream element */
+    GstQuery *query = gst_query_new_context ("gst.gl.local_context");
+    if (gst_pad_peer_query (GST_BASE_SRC_PAD (element), query)) {
+      GstContext *context;
+      gst_query_parse_context (query, &context);
+      if (context) {
+        const GstStructure *s = gst_context_get_structure (context);
+        gst_structure_get (s, "context", GST_GL_TYPE_CONTEXT, &glContext,
+            NULL);
+      }
     }
-  }
+    gst_query_unref (query);
+
+    if (glContext) {
+      GST_INFO_OBJECT (element, "pushing textures. Internal format %s, context %p",
+          gst_video_format_to_string (internalFormat), glContext);
+      textureCache = gst_core_video_texture_cache_new (glContext);
+      gst_core_video_texture_cache_set_format (textureCache, internalFormat, caps);
+      gst_object_unref (glContext);
+    } else {
+      GST_WARNING_OBJECT (element, "got memory:GLMemory caps but not GL context from downstream element");
+    }
+  } 
 
   return YES;
 }
@@ -793,7 +848,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 - (void)captureOutput:(AVCaptureOutput *)captureOutput
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-       fromConnection:(AVCaptureConnection *)connection
+       fromConnection:(AVCaptureConnection *)aConnection
 {
   GstClockTime timestamp, duration;
 
@@ -804,9 +859,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     return;
   }
 
-  if (inputClock == nil)
-    inputClock = ((AVCaptureInputPort *)connection.inputPorts[0]).clock;
   [self getSampleBuffer:sampleBuffer timestamp:&timestamp duration:&duration];
+
+  if (timestamp == GST_CLOCK_TIME_NONE) {
+    [bufQueueLock unlock];
+    return;
+  }
 
   if ([bufQueue count] == BUFFER_QUEUE_SIZE)
     [bufQueue removeLastObject];
@@ -863,7 +921,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
   }
 
-  *buf = gst_core_media_buffer_new (sbuf, useVideoMeta);
+  *buf = gst_core_media_buffer_new (sbuf, useVideoMeta, textureCache == NULL);
+  if (*buf == NULL) {
+    CFRelease (sbuf);
+    return GST_FLOW_ERROR;
+  }
+
   if (format == GST_VIDEO_FORMAT_RGBA) {
     /* So now buf contains BGRA data (!) . Since downstream is actually going to
      * use the GL upload meta to get RGBA textures (??), we need to override the
@@ -876,15 +939,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   CFRelease (sbuf);
 
   if (textureCache != NULL) {
-    GstVideoGLTextureType texture_types[4] = {GST_VIDEO_GL_TEXTURE_TYPE_RGBA, 0};
-    gst_buffer_add_video_gl_texture_upload_meta (*buf, 
-        GST_VIDEO_GL_TEXTURE_ORIENTATION_X_NORMAL_Y_NORMAL,
-        1, texture_types,
-        gst_core_video_texture_cache_upload, textureCache, NULL, NULL);
+    *buf = gst_core_video_texture_cache_get_gl_buffer (textureCache, *buf);
+    if (*buf == NULL)
+      return GST_FLOW_ERROR;
   }
 
   GST_BUFFER_OFFSET (*buf) = offset++;
-  GST_BUFFER_OFFSET_END (*buf) = GST_BUFFER_OFFSET (buf) + 1;
+  GST_BUFFER_OFFSET_END (*buf) = GST_BUFFER_OFFSET (*buf) + 1;
   GST_BUFFER_TIMESTAMP (*buf) = timestamp;
   GST_BUFFER_DURATION (*buf) = duration;
 
@@ -899,7 +960,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                duration:(GstClockTime *)outDuration
 {
   CMSampleTimingInfo time_info;
-  GstClockTime timestamp, duration, inputClockNow, running_time;
+  GstClockTime timestamp, avf_timestamp, duration, input_clock_now, input_clock_diff, running_time;
   CMItemCount num_timings;
   GstClock *clock;
   CMTime now;
@@ -907,19 +968,42 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   timestamp = GST_CLOCK_TIME_NONE;
   duration = GST_CLOCK_TIME_NONE;
   if (CMSampleBufferGetOutputSampleTimingInfoArray(sbuf, 1, &time_info, &num_timings) == noErr) {
-    timestamp = gst_util_uint64_scale (GST_SECOND,
+    avf_timestamp = gst_util_uint64_scale (GST_SECOND,
             time_info.presentationTimeStamp.value, time_info.presentationTimeStamp.timescale);
-    duration = gst_util_uint64_scale (GST_SECOND,
-            time_info.duration.value, time_info.duration.timescale);
+
+    if (CMTIME_IS_VALID (time_info.duration) && time_info.duration.timescale != 0)
+      duration = gst_util_uint64_scale (GST_SECOND,
+          time_info.duration.value, time_info.duration.timescale);
 
     now = CMClockGetTime(inputClock);
-    inputClockNow = gst_util_uint64_scale (GST_SECOND,
+    input_clock_now = gst_util_uint64_scale (GST_SECOND,
         now.value, now.timescale);
+    input_clock_diff = input_clock_now - avf_timestamp;
 
     GST_OBJECT_LOCK (element);
     clock = GST_ELEMENT_CLOCK (element);
-    running_time = gst_clock_get_time (clock) - element->base_time;
-    timestamp = running_time + (inputClockNow - timestamp);
+    if (clock) {
+      running_time = gst_clock_get_time (clock) - element->base_time;
+      /* We use presentationTimeStamp to determine how much time it took
+       * between capturing and receiving the frame in our delegate
+       * (e.g. how long it spent in AVF queues), then we subtract that time
+       * from our running time to get the actual timestamp.
+       */
+      if (running_time >= input_clock_diff)
+        timestamp = running_time - input_clock_diff;
+      else
+        timestamp = running_time;
+
+      GST_DEBUG_OBJECT (element, "AVF clock: %"GST_TIME_FORMAT ", AVF PTS: %"GST_TIME_FORMAT
+          ", AVF clock diff: %"GST_TIME_FORMAT
+          ", running time: %"GST_TIME_FORMAT ", out PTS: %"GST_TIME_FORMAT,
+          GST_TIME_ARGS (input_clock_now), GST_TIME_ARGS (avf_timestamp),
+          GST_TIME_ARGS (input_clock_diff),
+          GST_TIME_ARGS (running_time), GST_TIME_ARGS (timestamp));
+    } else {
+      /* no clock, can't set timestamps */
+      timestamp = GST_CLOCK_TIME_NONE;
+    }
     GST_OBJECT_UNLOCK (element);
   }
 

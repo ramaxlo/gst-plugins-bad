@@ -68,8 +68,6 @@ static void gst_gl_overlay_set_property (GObject * object, guint prop_id,
 static void gst_gl_overlay_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 
-static void gst_gl_overlay_reset_resources (GstGLFilter * filter);
-
 static void gst_gl_overlay_before_transform (GstBaseTransform * trans,
     GstBuffer * outbuf);
 static gboolean gst_gl_overlay_filter_texture (GstGLFilter * filter,
@@ -125,10 +123,11 @@ gst_gl_overlay_init_gl_resources (GstGLFilter * filter)
   GstGLOverlay *overlay = GST_GL_OVERLAY (filter);
 
   if (overlay->shader)
-    gst_gl_context_del_shader (filter->context, overlay->shader);
+    gst_gl_context_del_shader (GST_GL_BASE_FILTER (filter)->context,
+        overlay->shader);
 
-  return gst_gl_context_gen_shader (filter->context, overlay_v_src,
-      overlay_f_src, &overlay->shader);
+  return gst_gl_context_gen_shader (GST_GL_BASE_FILTER (filter)->context,
+      overlay_v_src, overlay_f_src, &overlay->shader);
 }
 
 /* free resources that need a gl context */
@@ -136,10 +135,11 @@ static void
 gst_gl_overlay_reset_gl_resources (GstGLFilter * filter)
 {
   GstGLOverlay *overlay = GST_GL_OVERLAY (filter);
-  const GstGLFuncs *gl = filter->context->gl_vtable;
+  const GstGLFuncs *gl = GST_GL_BASE_FILTER (filter)->context->gl_vtable;
 
   if (overlay->shader) {
-    gst_gl_context_del_shader (filter->context, overlay->shader);
+    gst_gl_context_del_shader (GST_GL_BASE_FILTER (filter)->context,
+        overlay->shader);
     overlay->shader = NULL;
   }
 
@@ -185,8 +185,7 @@ gst_gl_overlay_class_init (GstGLOverlayClass * klass)
   GST_GL_FILTER_CLASS (klass)->filter_texture = gst_gl_overlay_filter_texture;
   GST_GL_FILTER_CLASS (klass)->display_reset_cb =
       gst_gl_overlay_reset_gl_resources;
-  GST_GL_FILTER_CLASS (klass)->onStop = gst_gl_overlay_reset_resources;
-  GST_GL_FILTER_CLASS (klass)->onInitFBO = gst_gl_overlay_init_gl_resources;
+  GST_GL_FILTER_CLASS (klass)->init_fbo = gst_gl_overlay_init_gl_resources;
 
   GST_BASE_TRANSFORM_CLASS (klass)->before_transform =
       GST_DEBUG_FUNCPTR (gst_gl_overlay_before_transform);
@@ -245,7 +244,7 @@ gst_gl_overlay_class_init (GstGLOverlayClass * klass)
       "Filippo Argiolas <filippo.argiolas@gmail.com>, "
       "Matthew Waters <matthew@centricular.com>");
 
-  GST_GL_FILTER_CLASS (klass)->supported_gl_api =
+  GST_GL_BASE_FILTER_CLASS (klass)->supported_gl_api =
       GST_GL_API_OPENGL | GST_GL_API_GLES2 | GST_GL_API_OPENGL3;
 }
 
@@ -262,11 +261,6 @@ gst_gl_overlay_init (GstGLOverlay * overlay)
   overlay->overlay_height = 0;
 
   overlay->alpha = 1.0;
-}
-
-static void
-gst_gl_overlay_reset_resources (GstGLFilter * filter)
-{
 }
 
 static void
@@ -373,7 +367,7 @@ gst_gl_overlay_set_caps (GstGLFilter * filter, GstCaps * incaps,
 static void
 _unbind_buffer (GstGLOverlay * overlay)
 {
-  const GstGLFuncs *gl = GST_GL_FILTER (overlay)->context->gl_vtable;
+  const GstGLFuncs *gl = GST_GL_BASE_FILTER (overlay)->context->gl_vtable;
 
   gl->BindBuffer (GL_ARRAY_BUFFER, 0);
 
@@ -384,7 +378,7 @@ _unbind_buffer (GstGLOverlay * overlay)
 static void
 _bind_buffer (GstGLOverlay * overlay, GLuint vbo)
 {
-  const GstGLFuncs *gl = GST_GL_FILTER (overlay)->context->gl_vtable;
+  const GstGLFuncs *gl = GST_GL_BASE_FILTER (overlay)->context->gl_vtable;
 
   gl->BindBuffer (GL_ARRAY_BUFFER, vbo);
 
@@ -415,7 +409,7 @@ gst_gl_overlay_callback (gint width, gint height, guint texture, gpointer stuff)
   GstMapInfo map_info;
   guint image_tex;
   gboolean memory_mapped = FALSE;
-  const GstGLFuncs *gl = filter->context->gl_vtable;
+  const GstGLFuncs *gl = GST_GL_BASE_FILTER (filter)->context->gl_vtable;
 
   GLushort indices[] = {
     0, 1, 2,
@@ -423,14 +417,16 @@ gst_gl_overlay_callback (gint width, gint height, guint texture, gpointer stuff)
   };
 
 #if GST_GL_HAVE_OPENGL
-  if (gst_gl_context_get_gl_api (filter->context) & GST_GL_API_OPENGL) {
+  if (gst_gl_context_get_gl_api (GST_GL_BASE_FILTER (filter)->context) &
+      GST_GL_API_OPENGL) {
 
     gl->MatrixMode (GL_PROJECTION);
     gl->LoadIdentity ();
   }
 #endif
 
-  if (gst_gl_context_get_gl_api (filter->context) & GST_GL_API_OPENGL)
+  if (gst_gl_context_get_gl_api (GST_GL_BASE_FILTER (filter)->context) &
+      GST_GL_API_OPENGL)
     gl->Enable (GL_TEXTURE_2D);
 
   gl->ActiveTexture (GL_TEXTURE0);
@@ -549,7 +545,7 @@ out:
     _unbind_buffer (overlay);
   }
 
-  gst_gl_context_clear_shader (filter->context);
+  gst_gl_context_clear_shader (GST_GL_BASE_FILTER (filter)->context);
 
   if (memory_mapped)
     gst_memory_unmap ((GstMemory *) overlay->image_memory, &map_info);
@@ -610,6 +606,7 @@ gst_gl_overlay_load_jpeg (GstGLFilter * filter)
 {
   GstGLOverlay *overlay = GST_GL_OVERLAY (filter);
   GstVideoInfo v_info;
+  GstVideoAlignment v_align;
   GstMapInfo map_info;
   FILE *fp = NULL;
   struct jpeg_decompress_struct cinfo;
@@ -637,8 +634,13 @@ gst_gl_overlay_load_jpeg (GstGLFilter * filter)
     gst_video_info_set_format (&v_info, GST_VIDEO_FORMAT_RGB,
         overlay->image_width, overlay->image_height);
 
+  gst_video_alignment_reset (&v_align);
+  v_align.stride_align[0] = 32 - 1;
+  gst_video_info_align (&v_info, &v_align);
+
   overlay->image_memory =
-      (GstGLMemory *) gst_gl_memory_alloc (filter->context, &v_info, 0, NULL);
+      (GstGLMemory *) gst_gl_memory_alloc (GST_GL_BASE_FILTER (filter)->context,
+      NULL, &v_info, 0, &v_align);
 
   if (!gst_memory_map ((GstMemory *) overlay->image_memory, &map_info,
           GST_MAP_WRITE)) {
@@ -646,9 +648,7 @@ gst_gl_overlay_load_jpeg (GstGLFilter * filter)
   }
 
   for (i = 0; i < overlay->image_height; ++i) {
-    j = (map_info.data +
-        (((int) overlay->image_height - (i +
-                    1)) * (int) overlay->image_width * cinfo.num_components));
+    j = map_info.data + v_info.stride[0] * i;
     jpeg_read_scanlines (&cinfo, &j, 1);
   }
   jpeg_finish_decompress (&cinfo);
@@ -679,7 +679,7 @@ gst_gl_overlay_load_png (GstGLFilter * filter)
   png_byte magic[8];
   gint n_read;
 
-  if (!filter->context)
+  if (!GST_GL_BASE_FILTER (filter)->context)
     return 1;
 
   if ((fp = fopen (overlay->location, "rb")) == NULL)
@@ -740,7 +740,8 @@ gst_gl_overlay_load_png (GstGLFilter * filter)
 
   gst_video_info_set_format (&v_info, GST_VIDEO_FORMAT_RGBA, width, height);
   overlay->image_memory =
-      (GstGLMemory *) gst_gl_memory_alloc (filter->context, &v_info, 0, NULL);
+      (GstGLMemory *) gst_gl_memory_alloc (GST_GL_BASE_FILTER (filter)->context,
+      NULL, &v_info, 0, NULL);
 
   if (!gst_memory_map ((GstMemory *) overlay->image_memory, &map_info,
           GST_MAP_WRITE)) {

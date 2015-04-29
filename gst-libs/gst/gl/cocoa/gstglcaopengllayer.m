@@ -24,21 +24,37 @@
 
 #include <Cocoa/Cocoa.h>
 
+#include "gstglcaopengllayer.h"
 #include "gstgl_cocoa_private.h"
 
 @implementation GstGLCAOpenGLLayer
 - (void)dealloc {
+  if (self->draw_notify)
+    self->draw_notify (self->draw_data);
+
   GST_TRACE ("dealloc GstGLCAOpenGLLayer %p context %p", self, self->gst_gl_context);
 
   [super dealloc];
 }
 
+static void
+_context_ready (gpointer data)
+{
+  GstGLCAOpenGLLayer *ca_layer = data;
+
+  g_atomic_int_set (&ca_layer->can_draw, 1);
+}
+
 - (id)initWithGstGLContext:(GstGLContextCocoa *)parent_gl_context {
   [super init];
 
-  GST_TRACE ("init CAOpenGLLayer");
+  GST_LOG ("init CAOpenGLLayer");
 
   self->gst_gl_context = parent_gl_context;
+  self.needsDisplayOnBoundsChange = YES;
+
+  gst_gl_window_send_message_async (GST_GL_CONTEXT (parent_gl_context)->window,
+      (GstGLWindowCB) _context_ready, self, NULL);
 
   return self;
 }
@@ -87,32 +103,71 @@
   return self->gl_context;
 }
 
-- (void)resize:(NSRect)bounds {
-  const GstGLFuncs *gl = ((GstGLContext *)self->gst_gl_context)->gl_vtable;
-
-  gl->GetIntegerv (GL_VIEWPORT, self->expected_dims);
-}
-
 - (void)releaseCGLContext:(CGLContextObj)glContext {
   CGLReleaseContext (glContext);
+}
+
+- (void)setDrawCallback:(GstGLWindowCB)cb data:(gpointer)data
+      notify:(GDestroyNotify)notify {
+  g_return_if_fail (cb);
+
+  if (self->draw_notify)
+    self->draw_notify (self->draw_data);
+
+  self->draw_cb = cb;
+  self->draw_data = data;
+  self->draw_notify = notify;
+}
+
+- (void)setResizeCallback:(GstGLWindowResizeCB)cb data:(gpointer)data
+      notify:(GDestroyNotify)notify {
+  if (self->resize_notify)
+    self->resize_notify (self->resize_notify);
+
+  self->resize_cb = cb;
+  self->resize_data = data;
+  self->resize_notify = notify;
+}
+
+- (BOOL)canDrawInCGLContext:(CGLContextObj)glContext
+               pixelFormat:(CGLPixelFormatObj)pixelFormat
+            forLayerTime:(CFTimeInterval)interval
+             displayTime:(const CVTimeStamp *)timeStamp {
+  return g_atomic_int_get (&self->can_draw);
 }
 
 - (void)drawInCGLContext:(CGLContextObj)glContext
                pixelFormat:(CGLPixelFormatObj)pixelFormat
             forLayerTime:(CFTimeInterval)interval
              displayTime:(const CVTimeStamp *)timeStamp {
-  GstGLWindow *window = gst_gl_context_get_window (GST_GL_CONTEXT (self->gst_gl_context));
   const GstGLFuncs *gl = ((GstGLContext *)self->gst_gl_context)->gl_vtable;
+  GstVideoRectangle src, dst, result;
   gint ca_viewport[4];
 
-  GST_LOG ("CAOpenGLLayer drawing with window %p cgl context %p", window, glContext);
+  GST_LOG ("CAOpenGLLayer drawing with cgl context %p", glContext);
 
   /* attempt to get the correct viewport back due to CA being too smart
    * and messing around with it so center the expected viewport into
    * the CA viewport set up on entry to this function */
   gl->GetIntegerv (GL_VIEWPORT, ca_viewport);
 
-  GstVideoRectangle src, dst, result;
+  if (self->last_bounds.size.width != self.bounds.size.width
+      || self->last_bounds.size.height != self.bounds.size.height) {
+    if (self->resize_cb) {
+      self->resize_cb (self->resize_data, self.bounds.size.width,
+          self.bounds.size.height);
+
+      gl->GetIntegerv (GL_VIEWPORT, self->expected_dims);
+    } else {
+      /* default to whatever ca gives us */
+      self->expected_dims[0] = ca_viewport[0];
+      self->expected_dims[1] = ca_viewport[1];
+      self->expected_dims[2] = ca_viewport[2];
+      self->expected_dims[3] = ca_viewport[3];
+    }
+
+    self->last_bounds = self.bounds;
+  }
 
   src.x = self->expected_dims[0];
   src.y = self->expected_dims[1];
@@ -128,11 +183,8 @@
 
   gl->Viewport (result.x, result.y, result.w, result.h);
 
-  if (window) {
-    gst_gl_window_cocoa_draw_thread (GST_GL_WINDOW_COCOA (window));
-
-    gst_object_unref (window);
-  }
+  if (self->draw_cb)
+    self->draw_cb (self->draw_data);
 
   /* flushes the buffer */
   [super drawInCGLContext:glContext pixelFormat:pixelFormat forLayerTime:interval displayTime:timeStamp];

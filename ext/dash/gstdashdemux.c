@@ -152,7 +152,14 @@
 #include "gstdashdemux.h"
 #include "gstdash_debug.h"
 
-static GstStaticPadTemplate srctemplate = GST_STATIC_PAD_TEMPLATE ("src_%u",
+static GstStaticPadTemplate gst_dash_demux_videosrc_template =
+GST_STATIC_PAD_TEMPLATE ("video_%02u",
+    GST_PAD_SRC,
+    GST_PAD_SOMETIMES,
+    GST_STATIC_CAPS_ANY);
+
+static GstStaticPadTemplate gst_dash_demux_audiosrc_template =
+GST_STATIC_PAD_TEMPLATE ("audio_%02u",
     GST_PAD_SRC,
     GST_PAD_SOMETIMES,
     GST_STATIC_CAPS_ANY);
@@ -207,7 +214,7 @@ static gboolean gst_dash_demux_stream_select_bitrate (GstAdaptiveDemuxStream *
 static gint64
 gst_dash_demux_get_manifest_update_interval (GstAdaptiveDemux * demux);
 static GstFlowReturn
-gst_dash_demux_update_manifest (GstAdaptiveDemux * demux, GstBuffer * buf);
+gst_dash_demux_update_manifest_data (GstAdaptiveDemux * demux, GstBuffer * buf);
 static gint64
 gst_dash_demux_stream_get_fragment_waiting_time (GstAdaptiveDemuxStream *
     stream);
@@ -225,7 +232,8 @@ static void gst_dash_demux_stream_free (GstAdaptiveDemuxStream * stream);
 
 static GstCaps *gst_dash_demux_get_input_caps (GstDashDemux * demux,
     GstActiveStream * stream);
-static GstPad *gst_dash_demux_create_pad (GstDashDemux * demux);
+static GstPad *gst_dash_demux_create_pad (GstDashDemux * demux,
+    GstActiveStream * stream);
 
 #define SIDX(s) (&(s)->sidx_parser.sidx)
 #define SIDX_ENTRY(s,i) (&(SIDX(s)->entries[(i)]))
@@ -254,6 +262,37 @@ gst_dash_demux_dispose (GObject * obj)
   G_OBJECT_CLASS (parent_class)->dispose (obj);
 }
 
+static gboolean
+gst_dash_demux_get_live_seek_range (GstAdaptiveDemux * demux, gint64 * start,
+    gint64 * stop)
+{
+  GstDashDemux *self = GST_DASH_DEMUX (demux);
+  GDateTime *now = g_date_time_new_now_utc ();
+  GDateTime *mstart =
+      gst_date_time_to_g_date_time (self->client->
+      mpd_node->availabilityStartTime);
+  GTimeSpan stream_now;
+
+  stream_now = g_date_time_difference (now, mstart);
+  g_date_time_unref (now);
+  g_date_time_unref (mstart);
+  *stop = stream_now * GST_USECOND;
+
+  *start = *stop - (self->client->mpd_node->timeShiftBufferDepth * GST_MSECOND);
+  return TRUE;
+}
+
+static GstClockTime
+gst_dash_demux_get_presentation_offset (GstAdaptiveDemux * demux,
+    GstAdaptiveDemuxStream * stream)
+{
+  GstDashDemuxStream *dashstream = (GstDashDemuxStream *) stream;
+  GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
+
+  return gst_mpd_parser_get_stream_presentation_offset (dashdemux->client,
+      dashstream->index);
+}
+
 static void
 gst_dash_demux_class_init (GstDashDemuxClass * klass)
 {
@@ -276,14 +315,15 @@ gst_dash_demux_class_init (GstDashDemuxClass * klass)
           "(deprecated)",
           2, G_MAXUINT, DEFAULT_MAX_BUFFERING_TIME,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_DEPRECATED));
-#endif
 
   g_object_class_install_property (gobject_class, PROP_BANDWIDTH_USAGE,
       g_param_spec_float ("bandwidth-usage",
           "Bandwidth usage [0..1]",
-          "Percentage of the available bandwidth to use when selecting representations",
+          "Percentage of the available bandwidth to use when "
+          "selecting representations (deprecated)",
           0, 1, DEFAULT_BANDWIDTH_USAGE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+#endif
 
   g_object_class_install_property (gobject_class, PROP_MAX_BITRATE,
       g_param_spec_uint ("max-bitrate", "Max bitrate",
@@ -292,7 +332,9 @@ gst_dash_demux_class_init (GstDashDemuxClass * klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_pad_template (gstelement_class,
-      gst_static_pad_template_get (&srctemplate));
+      gst_static_pad_template_get (&gst_dash_demux_audiosrc_template));
+  gst_element_class_add_pad_template (gstelement_class,
+      gst_static_pad_template_get (&gst_dash_demux_videosrc_template));
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&sinktemplate));
@@ -312,7 +354,8 @@ gst_dash_demux_class_init (GstDashDemuxClass * klass)
   gstadaptivedemux_class->seek = gst_dash_demux_seek;
 
   gstadaptivedemux_class->process_manifest = gst_dash_demux_process_manifest;
-  gstadaptivedemux_class->update_manifest = gst_dash_demux_update_manifest;
+  gstadaptivedemux_class->update_manifest_data =
+      gst_dash_demux_update_manifest_data;
   gstadaptivedemux_class->get_manifest_update_interval =
       gst_dash_demux_get_manifest_update_interval;
 
@@ -328,6 +371,10 @@ gst_dash_demux_class_init (GstDashDemuxClass * klass)
   gstadaptivedemux_class->stream_update_fragment_info =
       gst_dash_demux_stream_update_fragment_info;
   gstadaptivedemux_class->stream_free = gst_dash_demux_stream_free;
+  gstadaptivedemux_class->get_live_seek_range =
+      gst_dash_demux_get_live_seek_range;
+  gstadaptivedemux_class->get_presentation_offset =
+      gst_dash_demux_get_presentation_offset;
 }
 
 static void
@@ -335,7 +382,6 @@ gst_dash_demux_init (GstDashDemux * demux)
 {
   /* Properties */
   demux->max_buffering_time = DEFAULT_MAX_BUFFERING_TIME * GST_SECOND;
-  demux->bandwidth_usage = DEFAULT_BANDWIDTH_USAGE;
   demux->max_bitrate = DEFAULT_MAX_BITRATE;
 
   g_mutex_init (&demux->client_lock);
@@ -348,6 +394,7 @@ static void
 gst_dash_demux_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
 {
+  GstAdaptiveDemux *adaptivedemux = GST_ADAPTIVE_DEMUX_CAST (object);
   GstDashDemux *demux = GST_DASH_DEMUX (object);
 
   switch (prop_id) {
@@ -355,7 +402,7 @@ gst_dash_demux_set_property (GObject * object, guint prop_id,
       demux->max_buffering_time = g_value_get_uint (value) * GST_SECOND;
       break;
     case PROP_BANDWIDTH_USAGE:
-      demux->bandwidth_usage = g_value_get_float (value);
+      adaptivedemux->bitrate_limit = g_value_get_float (value);
       break;
     case PROP_MAX_BITRATE:
       demux->max_bitrate = g_value_get_uint (value);
@@ -370,6 +417,7 @@ static void
 gst_dash_demux_get_property (GObject * object, guint prop_id, GValue * value,
     GParamSpec * pspec)
 {
+  GstAdaptiveDemux *adaptivedemux = GST_ADAPTIVE_DEMUX_CAST (object);
   GstDashDemux *demux = GST_DASH_DEMUX (object);
 
   switch (prop_id) {
@@ -377,7 +425,7 @@ gst_dash_demux_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_set_uint (value, demux->max_buffering_time / GST_SECOND);
       break;
     case PROP_BANDWIDTH_USAGE:
-      g_value_set_float (value, demux->bandwidth_usage);
+      g_value_set_float (value, adaptivedemux->bitrate_limit);
       break;
     case PROP_MAX_BITRATE:
       g_value_set_uint (value, demux->max_bitrate);
@@ -437,8 +485,11 @@ gst_dash_demux_setup_all_streams (GstDashDemux * demux)
     active_stream = gst_mpdparser_get_active_stream_by_index (demux->client, i);
     if (active_stream == NULL)
       continue;
+    /* TODO: support 'application' mimeType */
+    if (active_stream->mimeType == GST_STREAM_APPLICATION)
+      continue;
 
-    srcpad = gst_dash_demux_create_pad (demux);
+    srcpad = gst_dash_demux_create_pad (demux, active_stream);
     caps = gst_dash_demux_get_input_caps (demux, active_stream);
     GST_LOG_OBJECT (demux, "Creating stream %d %" GST_PTR_FORMAT, i, caps);
 
@@ -626,15 +677,29 @@ gst_dash_demux_process_manifest (GstAdaptiveDemux * demux, GstBuffer * buf)
 }
 
 static GstPad *
-gst_dash_demux_create_pad (GstDashDemux * demux)
+gst_dash_demux_create_pad (GstDashDemux * demux, GstActiveStream * stream)
 {
   GstPad *pad;
   GstPadTemplate *tmpl;
+  gchar *name;
 
-  tmpl = gst_static_pad_template_get (&srctemplate);
+  switch (stream->mimeType) {
+    case GST_STREAM_AUDIO:
+      name = g_strdup_printf ("audio_%02u", demux->n_audio_streams++);
+      tmpl = gst_static_pad_template_get (&gst_dash_demux_audiosrc_template);
+      break;
+    case GST_STREAM_VIDEO:
+      name = g_strdup_printf ("video_%02u", demux->n_video_streams++);
+      tmpl = gst_static_pad_template_get (&gst_dash_demux_videosrc_template);
+      break;
+    default:
+      g_assert_not_reached ();
+      return NULL;
+  }
 
   /* Create and activate new pads */
-  pad = gst_ghost_pad_new_no_target_from_template (NULL, tmpl);
+  pad = gst_ghost_pad_new_no_target_from_template (name, tmpl);
+  g_free (name);
   gst_object_unref (tmpl);
 
   gst_pad_set_active (pad, TRUE);
@@ -657,6 +722,9 @@ gst_dash_demux_reset (GstAdaptiveDemux * ademux)
     demux->client = NULL;
   }
   demux->client = gst_mpd_client_new ();
+
+  demux->n_audio_streams = 0;
+  demux->n_video_streams = 0;
 }
 
 static GstCaps *
@@ -894,17 +962,23 @@ gst_dash_demux_stream_advance_subfragment (GstAdaptiveDemuxStream * stream)
   GstSidxBox *sidx = SIDX (dashstream);
   gboolean fragment_finished = TRUE;
 
-  if (stream->demux->segment.rate > 0.0) {
-    sidx->entry_index++;
-    if (sidx->entry_index < sidx->entries_count) {
-      fragment_finished = FALSE;
-    }
-  } else {
-    sidx->entry_index--;
-    if (sidx->entry_index >= 0) {
-      fragment_finished = FALSE;
+  if (dashstream->sidx_parser.status == GST_ISOFF_SIDX_PARSER_FINISHED) {
+    if (stream->demux->segment.rate > 0.0) {
+      sidx->entry_index++;
+      if (sidx->entry_index < sidx->entries_count) {
+        fragment_finished = FALSE;
+      }
+    } else {
+      sidx->entry_index--;
+      if (sidx->entry_index >= 0) {
+        fragment_finished = FALSE;
+      }
     }
   }
+
+  GST_DEBUG_OBJECT (stream->pad, "New sidx index: %d / %d. "
+      "Finished fragment: %d", sidx->entry_index, sidx->entries_count,
+      fragment_finished);
 
   if (!fragment_finished) {
     dashstream->sidx_current_remaining = sidx->entries[sidx->entry_index].size;
@@ -917,6 +991,8 @@ gst_dash_demux_stream_advance_fragment (GstAdaptiveDemuxStream * stream)
 {
   GstDashDemuxStream *dashstream = (GstDashDemuxStream *) stream;
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (stream->demux);
+
+  GST_DEBUG_OBJECT (stream->pad, "Advance fragment");
 
   if (gst_mpd_client_has_isoff_ondemand_profile (dashdemux->client)) {
     if (gst_dash_demux_stream_advance_subfragment (stream))
@@ -949,8 +1025,6 @@ gst_dash_demux_stream_select_bitrate (GstAdaptiveDemuxStream * stream,
   if (!rep_list) {
     goto end;
   }
-
-  bitrate *= demux->bandwidth_usage;
 
   GST_DEBUG_OBJECT (stream->pad,
       "Trying to change to bitrate: %" G_GUINT64_FORMAT, bitrate);
@@ -1072,7 +1146,8 @@ gst_dash_demux_get_manifest_update_interval (GstAdaptiveDemux * demux)
 }
 
 static GstFlowReturn
-gst_dash_demux_update_manifest (GstAdaptiveDemux * demux, GstBuffer * buffer)
+gst_dash_demux_update_manifest_data (GstAdaptiveDemux * demux,
+    GstBuffer * buffer)
 {
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
   GstMpdClient *new_client = NULL;
@@ -1246,11 +1321,15 @@ gst_dash_demux_stream_fragment_finished (GstAdaptiveDemux * demux,
     GstAdaptiveDemuxStream * stream)
 {
   GstDashDemux *dashdemux = GST_DASH_DEMUX_CAST (demux);
+  GstDashDemuxStream *dashstream = (GstDashDemuxStream *) stream;
 
-  if (gst_mpd_client_has_isoff_ondemand_profile (dashdemux->client)) {
+  if (gst_mpd_client_has_isoff_ondemand_profile (dashdemux->client) &&
+      dashstream->sidx_parser.status == GST_ISOFF_SIDX_PARSER_FINISHED) {
     /* fragment is advanced on data_received when byte limits are reached */
     return GST_FLOW_OK;
   } else {
+    if (G_UNLIKELY (stream->downloading_header || stream->downloading_index))
+      return GST_FLOW_OK;
     return gst_adaptive_demux_stream_advance_fragment (demux, stream,
         stream->fragment.duration);
   }

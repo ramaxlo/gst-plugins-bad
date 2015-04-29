@@ -28,10 +28,24 @@
 #define GST_CAT_DEFAULT gst_gl_sync_meta_debug
 GST_DEBUG_CATEGORY (GST_CAT_DEFAULT);
 
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#define GL_SYNC_FLUSH_COMMANDS_BIT        0x00000001
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#define GL_TIMEOUT_EXPIRED 0x911B
+#endif
+
 GstGLSyncMeta *
 gst_buffer_add_gl_sync_meta (GstGLContext * context, GstBuffer * buffer)
 {
-  GstGLSyncMeta *meta =
+  GstGLSyncMeta *meta;
+
+  g_return_val_if_fail (GST_GL_IS_CONTEXT (context), NULL);
+
+  meta =
       (GstGLSyncMeta *) gst_buffer_add_meta ((buffer), GST_GL_SYNC_META_INFO,
       NULL);
 
@@ -49,13 +63,11 @@ _set_sync_point (GstGLContext * context, GstGLSyncMeta * sync_meta)
 {
   const GstGLFuncs *gl = context->gl_vtable;
 
-  if (gl->FenceSync && gst_gl_context_get_gl_api (context) & GST_GL_API_OPENGL3) {
+  if (gl->FenceSync) {
     if (sync_meta->glsync)
       gl->DeleteSync (sync_meta->glsync);
-#if GST_GL_HAVE_OPENGL
     sync_meta->glsync = gl->FenceSync (GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    GST_LOG_OBJECT (sync_meta, "setting sync object %p", sync_meta->glsync);
-#endif
+    GST_LOG ("setting sync object %p", sync_meta->glsync);
   } else {
     gl->Flush ();
   }
@@ -69,7 +81,6 @@ gst_gl_sync_meta_set_sync_point (GstGLSyncMeta * sync_meta,
       (GstGLContextThreadFunc) _set_sync_point, sync_meta);
 }
 
-#if GST_GL_HAVE_OPENGL
 static void
 _wait (GstGLContext * context, GstGLSyncMeta * sync_meta)
 {
@@ -78,26 +89,24 @@ _wait (GstGLContext * context, GstGLSyncMeta * sync_meta)
 
   if (gl->ClientWaitSync) {
     do {
-      GST_LOG_OBJECT (sync_meta, "waiting on sync object %p",
-          sync_meta->glsync);
+      GST_LOG ("waiting on sync object %p", sync_meta->glsync);
       res =
           gl->ClientWaitSync (sync_meta->glsync, GL_SYNC_FLUSH_COMMANDS_BIT,
           1000000000 /* 1s */ );
     } while (res == GL_TIMEOUT_EXPIRED);
   }
 }
-#endif
 
 void
-gst_gl_sync_meta_wait (GstGLSyncMeta * sync_meta)
+gst_gl_sync_meta_wait (GstGLSyncMeta * sync_meta, GstGLContext * context)
 {
-#if GST_GL_HAVE_OPENGL
-  if (sync_meta->glsync
-      && gst_gl_context_get_gl_api (sync_meta->context) & GST_GL_API_OPENGL3) {
-    gst_gl_context_thread_add (sync_meta->context,
+  if (sync_meta->context == context)
+    return;
+
+  if (sync_meta->glsync) {
+    gst_gl_context_thread_add (context,
         (GstGLContextThreadFunc) _wait, sync_meta);
   }
-#endif
 }
 
 static gboolean

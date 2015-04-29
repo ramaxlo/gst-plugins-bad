@@ -157,9 +157,9 @@ static const GstDecklinkMode modes[] = {
   {bmdModeHD1080p2997, 1920, 1080, 30000, 1001, false, HD},
   {bmdModeHD1080p30, 1920, 1080, 30, 1, false, HD},
 
-  {bmdModeHD1080i50, 1920, 1080, 50, 1, true, HD},
-  {bmdModeHD1080i5994, 1920, 1080, 60000, 1001, true, HD},
-  {bmdModeHD1080i6000, 1920, 1080, 60, 1, true, HD},
+  {bmdModeHD1080i50, 1920, 1080, 25, 1, true, HD},
+  {bmdModeHD1080i5994, 1920, 1080, 30000, 1001, true, HD},
+  {bmdModeHD1080i6000, 1920, 1080, 30, 1, true, HD},
 
   {bmdModeHD1080p50, 1920, 1080, 50, 1, false, HD},
   {bmdModeHD1080p5994, 1920, 1080, 60000, 1001, false, HD},
@@ -350,7 +350,7 @@ gst_decklink_mode_get_template_caps (void)
   GstStructure *s;
 
   caps = gst_caps_new_empty ();
-  for (i = 0; i < (int) G_N_ELEMENTS (modes); i++) {
+  for (i = 1; i < (int) G_N_ELEMENTS (modes); i++) {
     s = gst_decklink_mode_get_structure ((GstDecklinkModeEnum) i);
     gst_caps_append_structure (caps, s);
   }
@@ -378,8 +378,8 @@ struct _GstDecklinkClock
 {
   GstSystemClock clock;
 
-  IDeckLinkInput *input;
-  IDeckLinkOutput *output;
+  GstDecklinkInput *input;
+  GstDecklinkOutput *output;
 };
 
 struct _GstDecklinkClockClass
@@ -474,24 +474,61 @@ public:
       VideoInputFrameArrived (IDeckLinkVideoInputFrame * video_frame,
       IDeckLinkAudioInputPacket * audio_packet)
   {
-    GstClockTime clock_time = gst_clock_get_time (m_input->clock);
+    GstElement *videosrc = NULL, *audiosrc = NULL;
+    void (*got_video_frame) (GstElement * videosrc,
+        IDeckLinkVideoInputFrame * frame, GstDecklinkModeEnum mode,
+        GstClockTime capture_time, GstClockTime capture_duration) = NULL;
+    void (*got_audio_packet) (GstElement * videosrc,
+        IDeckLinkAudioInputPacket * packet, GstClockTime capture_time) = NULL;
+    GstDecklinkModeEnum mode;
+    BMDTimeValue capture_time, capture_duration;
+    HRESULT res;
+
+    res =
+        video_frame->GetHardwareReferenceTimestamp (GST_SECOND, &capture_time,
+        &capture_duration);
+    if (res != S_OK) {
+      GST_ERROR ("Failed to get capture time: 0x%08x", res);
+      capture_time = GST_CLOCK_TIME_NONE;
+      capture_duration = GST_CLOCK_TIME_NONE;
+    }
 
     g_mutex_lock (&m_input->lock);
-    if (m_input->got_video_frame) {
-      GstClockTime capture_time = clock_time -
-          gst_element_get_base_time (m_input->videosrc);
-      m_input->got_video_frame (m_input->videosrc, video_frame,
-          gst_decklink_get_mode_enum_from_bmd (m_input->mode->mode),
-          capture_time);
-    }
 
-    if (m_input->got_audio_packet) {
-      GstClockTime capture_time = clock_time -
-          gst_element_get_base_time (m_input->audiosrc);
-      m_input->got_audio_packet (m_input->audiosrc, audio_packet, capture_time);
-    }
+    if (capture_time > (BMDTimeValue) m_input->clock_start_time)
+      capture_time -= m_input->clock_start_time;
+    else
+      capture_time = 0;
 
+    if (capture_time > (BMDTimeValue) m_input->clock_offset)
+      capture_time -= m_input->clock_offset;
+    else
+      capture_time = 0;
+
+    if (m_input->videosrc) {
+      videosrc = GST_ELEMENT_CAST (gst_object_ref (m_input->videosrc));
+      got_video_frame = m_input->got_video_frame;
+    }
+    mode = gst_decklink_get_mode_enum_from_bmd (m_input->mode->mode);
+
+    if (m_input->audiosrc) {
+      audiosrc = GST_ELEMENT_CAST (gst_object_ref (m_input->audiosrc));
+      got_audio_packet = m_input->got_audio_packet;
+    }
     g_mutex_unlock (&m_input->lock);
+
+    if (got_video_frame && videosrc) {
+      got_video_frame (videosrc, video_frame, mode, capture_time,
+          capture_duration);
+    }
+
+    if (got_audio_packet && audiosrc) {
+      m_input->got_audio_packet (audiosrc, audio_packet, capture_time);
+    }
+
+    gst_object_replace ((GstObject **) & videosrc, NULL);
+    gst_object_replace ((GstObject **) & audiosrc, NULL);
+
     return S_OK;
   }
 };
@@ -589,7 +626,7 @@ init_devices (gpointer data)
       devices[i].input.device = decklink;
       devices[i].input.clock = gst_decklink_clock_new ("GstDecklinkInputClock");
       GST_DECKLINK_CLOCK_CAST (devices[i].input.clock)->input =
-          devices[i].input.input;
+          &devices[i].input;
       devices[i].input.
           input->SetCallback (new GStreamerDecklinkInputCallback (&devices[i].
               input));
@@ -604,7 +641,7 @@ init_devices (gpointer data)
       devices[i].output.clock =
           gst_decklink_clock_new ("GstDecklinkOutputClock");
       GST_DECKLINK_CLOCK_CAST (devices[i].output.clock)->output =
-          devices[i].output.output;
+          &devices[i].output;
     }
 
     ret = decklink->QueryInterface (IID_IDeckLinkConfiguration,
@@ -806,30 +843,97 @@ static GstClockTime
 gst_decklink_clock_get_internal_time (GstClock * clock)
 {
   GstDecklinkClock *self = GST_DECKLINK_CLOCK (clock);
-  GstClockTime result;
+  GstClockTime result, start_time, last_time;
+  GstClockTimeDiff offset;
   BMDTimeValue time;
   HRESULT ret;
 
-  GST_OBJECT_LOCK (clock);
   if (self->input != NULL) {
-    ret =
-        self->input->GetHardwareReferenceClock (GST_SECOND, &time, NULL, NULL);
-    if (ret == S_OK && time >= 0)
-      result = time;
-    else
-      result = GST_CLOCK_TIME_NONE;
+    g_mutex_lock (&self->input->lock);
+    start_time = self->input->clock_start_time;
+    offset = self->input->clock_offset;
+    last_time = self->input->clock_last_time;
+    time = -1;
+    if (!self->input->started) {
+      result = last_time;
+      ret = -1;
+    } else {
+      ret =
+          self->input->input->GetHardwareReferenceClock (GST_SECOND, &time,
+          NULL, NULL);
+      if (ret == S_OK && time >= 0) {
+        result = time;
+        if (start_time == GST_CLOCK_TIME_NONE)
+          start_time = self->input->clock_start_time = result;
+
+        if (result > start_time)
+          result -= start_time;
+        else
+          result = 0;
+
+        if (self->input->clock_restart) {
+          self->input->clock_offset = result - last_time;
+          offset = self->input->clock_offset;
+          self->input->clock_restart = FALSE;
+        }
+        result = MAX (last_time, result);
+        result -= offset;
+        result = MAX (last_time, result);
+      } else {
+        result = last_time;
+      }
+
+      self->input->clock_last_time = result;
+    }
+    g_mutex_unlock (&self->input->lock);
   } else if (self->output != NULL) {
-    ret =
-        self->output->GetHardwareReferenceClock (GST_SECOND, &time, NULL, NULL);
-    if (ret == S_OK && time >= 0)
-      result = time;
-    else
-      result = GST_CLOCK_TIME_NONE;
+    g_mutex_lock (&self->output->lock);
+    start_time = self->output->clock_start_time;
+    offset = self->output->clock_offset;
+    last_time = self->output->clock_last_time;
+    time = -1;
+    if (!self->output->started) {
+      result = last_time;
+      ret = -1;
+    } else {
+      ret =
+          self->output->output->GetHardwareReferenceClock (GST_SECOND, &time,
+          NULL, NULL);
+      if (ret == S_OK && time >= 0) {
+        result = time;
+
+        if (start_time == GST_CLOCK_TIME_NONE)
+          start_time = self->output->clock_start_time = result;
+
+        if (result > start_time)
+          result -= start_time;
+        else
+          result = 0;
+
+        if (self->output->clock_restart) {
+          self->output->clock_offset = result - last_time;
+          offset = self->output->clock_offset;
+          self->output->clock_restart = FALSE;
+        }
+        result = MAX (last_time, result);
+        result -= offset;
+        result = MAX (last_time, result);
+      } else {
+        result = last_time;
+      }
+
+      self->output->clock_last_time = result;
+    }
+    g_mutex_unlock (&self->output->lock);
   } else {
-    result = GST_CLOCK_TIME_NONE;
+    g_assert_not_reached ();
   }
-  GST_OBJECT_UNLOCK (clock);
-  GST_LOG_OBJECT (clock, "result %" GST_TIME_FORMAT, GST_TIME_ARGS (result));
+  GST_LOG_OBJECT (clock,
+      "result %" GST_TIME_FORMAT " time %" GST_TIME_FORMAT " last time %"
+      GST_TIME_FORMAT " offset %" GST_TIME_FORMAT " start time %"
+      GST_TIME_FORMAT " (ret: 0x%08x)", GST_TIME_ARGS (result),
+      GST_TIME_ARGS (time), GST_TIME_ARGS (last_time), GST_TIME_ARGS (offset),
+      GST_TIME_ARGS (start_time), ret);
 
   return result;
 }

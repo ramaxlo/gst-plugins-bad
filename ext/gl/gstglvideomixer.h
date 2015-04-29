@@ -22,7 +22,6 @@
 #define _GST_GL_VIDEO_MIXER_H_
 
 #include "gstglmixer.h"
-#include "gstglmixerpad.h"
 
 G_BEGIN_DECLS
 
@@ -74,6 +73,7 @@ struct _GstGLVideoMixerClass
 };
 
 GType gst_gl_video_mixer_get_type (void);
+GType gst_gl_video_mixer_bin_get_type (void);
 
 G_END_DECLS
 

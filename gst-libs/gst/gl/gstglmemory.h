@@ -84,6 +84,7 @@ struct _GstGLMemory
 
   GstGLContext         *context;
   guint                 tex_id;
+  guint                 tex_target;
   GstVideoGLTextureType tex_type;
   GstVideoInfo          info;
   GstVideoAlignment     valign;
@@ -91,9 +92,9 @@ struct _GstGLMemory
   gfloat                tex_scaling[2];
 
   /* <private> */
+  gpointer              alloc_data;
   gpointer              data;
 
-  gboolean              data_wrapped;
   gboolean              texture_wrapped;
   GDestroyNotify        notify;
   gpointer              user_data;
@@ -102,6 +103,9 @@ struct _GstGLMemory
   guint                 tex_width;
   guint                 transfer_pbo;
   GstMapFlags           map_flags;
+  guint                 map_count;
+
+  GMutex                lock;
 };
 
 #define GST_CAPS_FEATURE_MEMORY_GL_MEMORY "memory:GLMemory"
@@ -151,12 +155,12 @@ struct _GstGLMemory
 void          gst_gl_memory_init (void);
 gboolean      gst_is_gl_memory (GstMemory * mem);
 
-GstMemory *   gst_gl_memory_alloc   (GstGLContext * context, GstVideoInfo * info, guint plane,
-                                     GstVideoAlignment *valign);
+GstMemory *   gst_gl_memory_alloc   (GstGLContext * context, GstAllocationParams *params,
+                                     GstVideoInfo * info, guint plane, GstVideoAlignment *valign);
 GstGLMemory * gst_gl_memory_wrapped (GstGLContext * context, GstVideoInfo * info, guint plane,
                                      GstVideoAlignment *valign, gpointer data,
                                      gpointer user_data, GDestroyNotify notify);
-GstGLMemory * gst_gl_memory_wrapped_texture (GstGLContext * context, guint texture_id,
+GstGLMemory * gst_gl_memory_wrapped_texture (GstGLContext * context, guint texture_id, guint texture_target,
                                              GstVideoInfo * info, guint plane, GstVideoAlignment *valign,
                                              gpointer user_data, GDestroyNotify notify);
 
@@ -165,8 +169,8 @@ gboolean      gst_gl_memory_copy_into_texture (GstGLMemory *gl_mem, guint tex_id
                                                gint width, gint height, gint stride,
                                                gboolean respecify);
 
-gboolean      gst_gl_memory_setup_buffer  (GstGLContext * context, GstVideoInfo * info, GstVideoAlignment *valign,
-                                           GstBuffer * buffer);
+gboolean      gst_gl_memory_setup_buffer  (GstGLContext * context, GstAllocationParams * params,
+                                           GstVideoInfo * info, GstVideoAlignment *valign, GstBuffer * buffer);
 gboolean      gst_gl_memory_setup_wrapped (GstGLContext * context, GstVideoInfo * info, GstVideoAlignment *valign,
                                            gpointer data[GST_VIDEO_MAX_PLANES],
                                            GstGLMemory *textures[GST_VIDEO_MAX_PLANES]);
@@ -176,6 +180,8 @@ gint          gst_gl_memory_get_texture_height (GstGLMemory * gl_mem);
 
 GstVideoGLTextureType gst_gl_texture_type_from_format (GstGLContext *context, GstVideoFormat v_format, guint plane);
 
+void gst_gl_memory_download_transfer (GstGLMemory * gl_mem);
+
 /**
  * GstGLAllocator
  *
@@ -184,6 +190,7 @@ GstVideoGLTextureType gst_gl_texture_type_from_format (GstGLContext *context, Gs
 struct _GstGLAllocator
 {
   GstAllocator parent;
+  GstMemoryCopyFunction fallback_mem_copy;
 };
 
 /**

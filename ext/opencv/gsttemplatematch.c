@@ -66,6 +66,7 @@
 #include "../../gst-libs/gst/gst-i18n-plugin.h"
 #include "gstopencvutils.h"
 #include "gsttemplatematch.h"
+#include <opencv2/imgproc/imgproc_c.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_template_match_debug);
 #define GST_CAT_DEFAULT gst_template_match_debug
@@ -356,7 +357,7 @@ gst_template_match_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       }
     }
   }
-  if (filter->cvTemplateImage && filter->cvImage && filter->cvDistImage) {
+  if (filter->cvTemplateImage && filter->cvDistImage) {
     GstStructure *s;
 
     gst_template_match_match (filter->cvImage, filter->cvTemplateImage,

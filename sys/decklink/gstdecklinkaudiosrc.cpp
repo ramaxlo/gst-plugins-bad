@@ -23,6 +23,7 @@
 #endif
 
 #include "gstdecklinkaudiosrc.h"
+#include "gstdecklinkvideosrc.h"
 #include <string.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_decklink_audio_src_debug);
@@ -92,7 +93,6 @@ static void gst_decklink_audio_src_finalize (GObject * object);
 static GstStateChangeReturn
 gst_decklink_audio_src_change_state (GstElement * element,
     GstStateChange transition);
-static GstClock *gst_decklink_audio_src_provide_clock (GstElement * element);
 
 static gboolean gst_decklink_audio_src_set_caps (GstBaseSrc * bsrc,
     GstCaps * caps);
@@ -126,8 +126,6 @@ gst_decklink_audio_src_class_init (GstDecklinkAudioSrcClass * klass)
 
   element_class->change_state =
       GST_DEBUG_FUNCPTR (gst_decklink_audio_src_change_state);
-  element_class->provide_clock =
-      GST_DEBUG_FUNCPTR (gst_decklink_audio_src_provide_clock);
 
   basesrc_class->get_caps = GST_DEBUG_FUNCPTR (gst_decklink_audio_src_get_caps);
   basesrc_class->set_caps = GST_DEBUG_FUNCPTR (gst_decklink_audio_src_set_caps);
@@ -376,10 +374,14 @@ gst_decklink_audio_src_set_caps (GstBaseSrc * bsrc, GstCaps * caps)
       sample_depth, 2);
   if (ret != S_OK) {
     GST_WARNING_OBJECT (self, "Failed to enable audio input");
-    gst_decklink_release_nth_input (self->device_number,
-        GST_ELEMENT_CAST (self), FALSE);
     return FALSE;
   }
+
+  g_mutex_lock (&self->input->lock);
+  self->input->audio_enabled = TRUE;
+  if (self->input->start_streams && self->input->videosrc)
+    self->input->start_streams (self->input->videosrc);
+  g_mutex_unlock (&self->input->lock);
 
   return TRUE;
 }
@@ -410,9 +412,24 @@ gst_decklink_audio_src_got_packet (GstElement * element,
     IDeckLinkAudioInputPacket * packet, GstClockTime capture_time)
 {
   GstDecklinkAudioSrc *self = GST_DECKLINK_AUDIO_SRC_CAST (element);
+  GstDecklinkVideoSrc *videosrc = NULL;
 
   GST_LOG_OBJECT (self, "Got audio packet at %" GST_TIME_FORMAT,
       GST_TIME_ARGS (capture_time));
+
+  g_mutex_lock (&self->input->lock);
+  if (self->input->videosrc)
+    videosrc =
+        GST_DECKLINK_VIDEO_SRC_CAST (gst_object_ref (self->input->videosrc));
+  g_mutex_unlock (&self->input->lock);
+
+  if (videosrc) {
+    gst_decklink_video_src_convert_to_external_clock (videosrc, &capture_time,
+        NULL);
+    gst_object_unref (videosrc);
+    GST_LOG_OBJECT (self, "Actual timestamp %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (capture_time));
+  }
 
   g_mutex_lock (&self->lock);
   if (!self->flushing) {
@@ -461,6 +478,7 @@ gst_decklink_audio_src_create (GstPushSrc * bsrc, GstBuffer ** buffer)
   if (self->flushing) {
     if (p)
       capture_packet_free (p);
+    GST_DEBUG_OBJECT (self, "Flushing");
     return GST_FLOW_FLUSHING;
   }
 
@@ -480,25 +498,20 @@ gst_decklink_audio_src_create (GstPushSrc * bsrc, GstBuffer ** buffer)
   ap->input = self->input->input;
   ap->input->AddRef ();
 
-  duration =
-      gst_util_uint64_scale_int (sample_count, GST_SECOND, self->info.rate);
-  // Our capture time is the end timestamp, subtract the
-  // duration to get the start timestamp
-  if (p->capture_time >= duration)
-    timestamp = p->capture_time - duration;
-  else
-    timestamp = 0;
+  timestamp = p->capture_time;
 
   // Jitter and discontinuity handling, based on audiobasesrc
   start_time = timestamp;
-  end_time = p->capture_time;
 
   // Convert to the sample numbers
-  end_offset = gst_util_uint64_scale (end_time, self->info.rate, GST_SECOND);
-  if (end_offset >= (guint64) sample_count)
-    start_offset = end_offset - sample_count;
-  else
-    start_offset = 0;
+  start_offset =
+      gst_util_uint64_scale (start_time, self->info.rate, GST_SECOND);
+
+  end_offset = start_offset + sample_count;
+  end_time = gst_util_uint64_scale_int (end_offset, GST_SECOND,
+      self->info.rate);
+
+  duration = end_time - start_time;
 
   if (self->next_offset == (guint64) - 1) {
     discont = TRUE;
@@ -554,6 +567,11 @@ gst_decklink_audio_src_create (GstPushSrc * bsrc, GstBuffer ** buffer)
 
   GST_BUFFER_TIMESTAMP (*buffer) = timestamp;
   GST_BUFFER_DURATION (*buffer) = duration;
+
+  GST_DEBUG_OBJECT (self,
+      "Outputting buffer %p with timestamp %" GST_TIME_FORMAT " and duration %"
+      GST_TIME_FORMAT, *buffer, GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (*buffer)),
+      GST_TIME_ARGS (GST_BUFFER_DURATION (*buffer)));
 
   capture_packet_free (p);
 
@@ -654,6 +672,9 @@ gst_decklink_audio_src_close (GstDecklinkAudioSrc * self)
   if (self->input) {
     g_mutex_lock (&self->input->lock);
     self->input->got_audio_packet = NULL;
+    self->input->audio_enabled = FALSE;
+    if (self->input->start_streams && self->input->videosrc)
+      self->input->start_streams (self->input->videosrc);
     g_mutex_unlock (&self->input->lock);
 
     self->input->input->DisableAudioInput ();
@@ -734,23 +755,8 @@ gst_decklink_audio_src_change_state (GstElement * element,
       if (videosrc)
         gst_object_unref (videosrc);
 
-      gst_element_post_message (element,
-          gst_message_new_clock_provide (GST_OBJECT_CAST (element),
-              self->input->clock, TRUE));
       self->flushing = FALSE;
       self->next_offset = -1;
-      break;
-    }
-    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:{
-      GstClock *clock;
-
-      clock = gst_element_get_clock (GST_ELEMENT_CAST (self));
-      if (clock && clock != self->input->clock) {
-        gst_clock_set_master (self->input->clock, clock);
-      }
-      if (clock)
-        gst_object_unref (clock);
-
       break;
     }
     default:
@@ -763,11 +769,6 @@ gst_decklink_audio_src_change_state (GstElement * element,
 
   switch (transition) {
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      gst_element_post_message (element,
-          gst_message_new_clock_lost (GST_OBJECT_CAST (element),
-              self->input->clock));
-      gst_clock_set_master (self->input->clock, NULL);
-
       g_queue_foreach (&self->current_packets, (GFunc) capture_packet_free,
           NULL);
       g_queue_clear (&self->current_packets);
@@ -781,15 +782,4 @@ gst_decklink_audio_src_change_state (GstElement * element,
 out:
 
   return ret;
-}
-
-static GstClock *
-gst_decklink_audio_src_provide_clock (GstElement * element)
-{
-  GstDecklinkAudioSrc *self = GST_DECKLINK_AUDIO_SRC_CAST (element);
-
-  if (!self->input)
-    return NULL;
-
-  return GST_CLOCK_CAST (gst_object_ref (self->input->clock));
 }

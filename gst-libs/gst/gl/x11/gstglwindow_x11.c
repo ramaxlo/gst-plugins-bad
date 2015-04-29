@@ -71,6 +71,7 @@ void gst_gl_window_x11_set_window_handle (GstGLWindow * window,
 guintptr gst_gl_window_x11_get_window_handle (GstGLWindow * window);
 static void gst_gl_window_x11_set_preferred_size (GstGLWindow * window,
     gint width, gint height);
+void gst_gl_window_x11_show (GstGLWindow * window);
 void gst_gl_window_x11_draw_unlocked (GstGLWindow * window);
 void gst_gl_window_x11_draw (GstGLWindow * window);
 void gst_gl_window_x11_run (GstGLWindow * window);
@@ -89,7 +90,17 @@ void gst_gl_window_x11_handle_events (GstGLWindow * window,
 static void
 gst_gl_window_x11_finalize (GObject * object)
 {
-  g_return_if_fail (GST_GL_IS_WINDOW_X11 (object));
+  GstGLWindowX11 *window_x11 = GST_GL_WINDOW_X11 (object);
+
+  if (window_x11->loop) {
+    g_main_loop_unref (window_x11->loop);
+    window_x11->loop = NULL;
+  }
+  if (window_x11->main_context) {
+    g_main_context_unref (window_x11->main_context);
+    window_x11->main_context = NULL;
+  }
+
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
@@ -123,12 +134,16 @@ gst_gl_window_x11_class_init (GstGLWindowX11Class * klass)
       GST_DEBUG_FUNCPTR (gst_gl_window_x11_handle_events);
   window_class->set_preferred_size =
       GST_DEBUG_FUNCPTR (gst_gl_window_x11_set_preferred_size);
+  window_class->show = GST_DEBUG_FUNCPTR (gst_gl_window_x11_show);
 }
 
 static void
 gst_gl_window_x11_init (GstGLWindowX11 * window)
 {
   window->priv = GST_GL_WINDOW_X11_GET_PRIVATE (window);
+
+  window->main_context = g_main_context_new ();
+  window->loop = g_main_loop_new (window->main_context, FALSE);
 }
 
 /* Must be called in the gl thread */
@@ -184,8 +199,6 @@ gst_gl_window_x11_open (GstGLWindow * window, GError ** error)
       DisplayHeight (window_x11->device, window_x11->screen_num);
 
   window_x11->x11_source = x11_event_source_new (window_x11);
-  window_x11->main_context = g_main_context_new ();
-  window_x11->loop = g_main_loop_new (window_x11->main_context, FALSE);
 
   g_source_attach (window_x11->x11_source, window_x11->main_context);
 
@@ -304,19 +317,20 @@ gst_gl_window_x11_close (GstGLWindow * window)
   g_source_destroy (window_x11->x11_source);
   g_source_unref (window_x11->x11_source);
   window_x11->x11_source = NULL;
-  g_main_loop_unref (window_x11->loop);
-  window_x11->loop = NULL;
-  g_main_context_unref (window_x11->main_context);
-  window_x11->main_context = NULL;
 
   window_x11->running = FALSE;
 }
 
-static void
-set_window_handle_cb (gpointer data)
+/* called by the gl thread */
+void
+gst_gl_window_x11_set_window_handle (GstGLWindow * window, guintptr id)
 {
-  GstGLWindowX11 *window_x11 = GST_GL_WINDOW_X11 (data);
+  GstGLWindowX11 *window_x11;
   XWindowAttributes attr;
+
+  window_x11 = GST_GL_WINDOW_X11 (window);
+
+  window_x11->parent_win = (Window) id;
 
   XGetWindowAttributes (window_x11->device, window_x11->parent_win, &attr);
 
@@ -327,28 +341,6 @@ set_window_handle_cb (gpointer data)
       window_x11->parent_win, 0, 0);
 
   XSync (window_x11->device, FALSE);
-}
-
-/* Not called by the gl thread */
-void
-gst_gl_window_x11_set_window_handle (GstGLWindow * window, guintptr id)
-{
-  GstGLWindowX11 *window_x11;
-
-  window_x11 = GST_GL_WINDOW_X11 (window);
-
-  window_x11->parent_win = (Window) id;
-
-  /* The loop may not exist yet because it's created in GstGLWindow::open
-   * which is only called when going from READY to PAUSED state.
-   * If no loop then the parent is directly set in XCreateWindow
-   */
-  if (window_x11->loop && g_main_loop_is_running (window_x11->loop)) {
-    GST_LOG ("set parent window id: %" G_GUINTPTR_FORMAT, id);
-
-    gst_gl_window_send_message (window, (GstGLWindowCB) set_window_handle_cb,
-        window_x11);
-  }
 }
 
 guintptr
@@ -369,6 +361,37 @@ gst_gl_window_x11_set_preferred_size (GstGLWindow * window, gint width,
 
   window_x11->priv->preferred_width = width;
   window_x11->priv->preferred_height = height;
+}
+
+static void
+_show_window (GstGLWindow * window)
+{
+  GstGLWindowX11 *window_x11 = GST_GL_WINDOW_X11 (window);
+  guint width = window_x11->priv->preferred_width;
+  guint height = window_x11->priv->preferred_height;
+  XWindowAttributes attr;
+
+  XGetWindowAttributes (window_x11->device, window_x11->internal_win_id, &attr);
+
+  if (!window_x11->visible) {
+
+    if (!window_x11->parent_win) {
+      attr.width = width;
+      attr.height = height;
+      XResizeWindow (window_x11->device, window_x11->internal_win_id,
+          attr.width, attr.height);
+      XSync (window_x11->device, FALSE);
+    }
+
+    XMapWindow (window_x11->device, window_x11->internal_win_id);
+    window_x11->visible = TRUE;
+  }
+}
+
+void
+gst_gl_window_x11_show (GstGLWindow * window)
+{
+  gst_gl_window_send_message (window, (GstGLWindowCB) _show_window, window);
 }
 
 /* Called in the gl thread */
@@ -397,28 +420,12 @@ static void
 draw_cb (gpointer data)
 {
   GstGLWindowX11 *window_x11 = data;
-  guint width = window_x11->priv->preferred_width;
-  guint height = window_x11->priv->preferred_height;
 
   if (g_main_loop_is_running (window_x11->loop)) {
     XWindowAttributes attr;
 
     XGetWindowAttributes (window_x11->device, window_x11->internal_win_id,
         &attr);
-
-    if (!window_x11->visible) {
-
-      if (!window_x11->parent_win) {
-        attr.width = width;
-        attr.height = height;
-        XResizeWindow (window_x11->device, window_x11->internal_win_id,
-            attr.width, attr.height);
-        XSync (window_x11->device, FALSE);
-      }
-
-      XMapWindow (window_x11->device, window_x11->internal_win_id);
-      window_x11->visible = TRUE;
-    }
 
     if (window_x11->parent_win) {
       XWindowAttributes attr_parent;
@@ -532,7 +539,6 @@ gst_gl_window_x11_handle_event (GstGLWindowX11 * window_x11)
   KeySym keysym;
   struct mouse_event *mouse_data;
   struct key_event *key_data;
-  XWindowAttributes attr;
 
   window = GST_GL_WINDOW (window_x11);
 
@@ -542,10 +548,6 @@ gst_gl_window_x11_handle_event (GstGLWindowX11 * window_x11)
 
     /* XSendEvent (which are called in other threads) are done from another display structure */
     XNextEvent (window_x11->device, &event);
-    XGetWindowAttributes (window_x11->device, window_x11->internal_win_id,
-        &attr);
-    window_x11->current_width = attr.width;
-    window_x11->current_height = attr.height;
 
     window_x11->allow_extra_expose_events = XPending (window_x11->device) <= 2;
 
@@ -578,6 +580,9 @@ gst_gl_window_x11_handle_event (GstGLWindowX11 * window_x11)
         if (window->resize)
           window->resize (window->resize_data, event.xconfigure.width,
               event.xconfigure.height);
+
+        window_x11->current_width = event.xconfigure.width;
+        window_x11->current_height = event.xconfigure.width;
         break;
       }
 
@@ -603,6 +608,9 @@ gst_gl_window_x11_handle_event (GstGLWindowX11 * window_x11)
 
           gst_object_unref (context);
         }
+
+        window_x11->current_width = event.xexpose.width;
+        window_x11->current_height = event.xexpose.width;
         break;
 
       case VisibilityNotify:

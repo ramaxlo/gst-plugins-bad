@@ -100,6 +100,8 @@ gst_gl_upload_meta_new (GstGLContext * context)
 
   upload->context = gst_object_ref (context);
 
+  GST_DEBUG_OBJECT (upload, "Created upload for context %"GST_PTR_FORMAT, upload->context);
+  
   return upload;
 }
 
@@ -108,6 +110,7 @@ gst_gl_upload_meta_finalize (GObject * object)
 {
   GstGLUploadMeta *upload;
 
+  GST_DEBUG_OBJECT (object, "Finalizing");
   upload = GST_GL_UPLOAD_META (object);
 
   gst_gl_upload_meta_reset (upload);
@@ -221,9 +224,11 @@ _perform_with_gl_memory (GstGLUploadMeta * upload, GstVideoGLTextureUploadMeta *
       GstGLMemory *out_mem;
       gint mem_width, mem_height;
 
-      if (!upload->priv->out_tex[i])
+      if (!upload->priv->out_tex[i]) {
+        /* the GL upload meta creates GL_TEXTURE_2D textures */
         upload->priv->out_tex[i] = gst_gl_memory_wrapped_texture (upload->context,
-            texture_id[i], &upload->info, i, NULL, NULL, NULL);
+            texture_id[i], GL_TEXTURE_2D, &upload->info, i, NULL, NULL, NULL);
+      }
 
       out_mem = upload->priv->out_tex[i];
 

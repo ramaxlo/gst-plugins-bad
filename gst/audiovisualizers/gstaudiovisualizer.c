@@ -3,19 +3,20 @@
  *
  * gstaudiovisualizer.h: base class for audio visualisation elements
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Library General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Library General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
+ * You should have received a copy of the GNU Library General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+ * Boston, MA 02110-1301, USA.
  */
 /**
  * SECTION:gstaudiovisualizer
@@ -63,7 +64,7 @@ static void gst_audio_visualizer_set_property (GObject * object,
     guint prop_id, const GValue * value, GParamSpec * pspec);
 static void gst_audio_visualizer_get_property (GObject * object,
     guint prop_id, GValue * value, GParamSpec * pspec);
-static void gst_audio_visualizer_dispose (GObject * object);
+static void gst_audio_visualizer_finalize (GObject * object);
 
 static gboolean gst_audio_visualizer_src_negotiate (GstAudioVisualizer * scope);
 static gboolean gst_audio_visualizer_src_setcaps (GstAudioVisualizer *
@@ -548,7 +549,7 @@ gst_audio_visualizer_class_init (GstAudioVisualizerClass * klass)
 
   gobject_class->set_property = gst_audio_visualizer_set_property;
   gobject_class->get_property = gst_audio_visualizer_get_property;
-  gobject_class->dispose = gst_audio_visualizer_dispose;
+  gobject_class->finalize = gst_audio_visualizer_finalize;
 
   element_class->change_state =
       GST_DEBUG_FUNCPTR (gst_audio_visualizer_change_state);
@@ -655,7 +656,7 @@ gst_audio_visualizer_get_property (GObject * object, guint prop_id,
 }
 
 static void
-gst_audio_visualizer_dispose (GObject * object)
+gst_audio_visualizer_finalize (GObject * object)
 {
   GstAudioVisualizer *scope = GST_AUDIO_VISUALIZER (object);
 
@@ -672,11 +673,10 @@ gst_audio_visualizer_dispose (GObject * object)
     gst_buffer_unref (scope->tempbuf);
     scope->tempbuf = NULL;
   }
-  if (scope->config_lock.p) {
-    g_mutex_clear (&scope->config_lock);
-    scope->config_lock.p = NULL;
-  }
-  G_OBJECT_CLASS (parent_class)->dispose (object);
+
+  g_mutex_clear (&scope->config_lock);
+
+  G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
 static void

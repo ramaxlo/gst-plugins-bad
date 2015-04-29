@@ -1,4 +1,4 @@
-AC_PREREQ([2.68])
+AC_PREREQ([2.69])
 
 dnl initialize autoconf
 dnl when going to/from release please set the nano (fourth number) right !
@@ -8,7 +8,7 @@ AC_INIT([GStreamer Bad Plug-ins],[1.5.0.1],[http://bugzilla.gnome.org/enter_bug.
 AG_GST_INIT
 
 dnl initialize automake
-AM_INIT_AUTOMAKE([-Wno-portability 1.11 no-dist-gzip dist-xz tar-ustar subdir-objects])
+AM_INIT_AUTOMAKE([-Wno-portability 1.14 no-dist-gzip dist-xz tar-ustar subdir-objects])
 
 dnl define PACKAGE_VERSION_* variables
 AS_VERSION
@@ -421,8 +421,8 @@ GST_PLUGINS_NONPORTED=" cdxaparse \
  apexsink dc1394 \
  gsettings \
  musepack nas sdl timidity \
- directdraw acm wininet \
- xvid lv2 teletextdec sndio osx_video libvisual"
+ acm wininet \
+ xvid lv2 teletextdec sndio libvisual"
 AC_SUBST(GST_PLUGINS_NONPORTED)
 
 dnl these are all the gst plug-ins, compilable without additional libs
@@ -837,7 +837,7 @@ if test "x$HAVE_GL" = "xyes" -a "x$HAVE_GLES2" = "xyes"; then
     ]])],[ AC_MSG_RESULT(yes)
     ],[AC_MSG_RESULT(no)
     if test "x$NEED_GLES2" = "xyes"; then
-      if test "x$NEED_OPENGL" = "xyes"; then
+      if test "x$NEED_GL" = "xyes"; then
         AC_MSG_ERROR([Cannot seem to include both GL and GLES2 headers. Try disabling one API])
       fi
       AC_MSG_WARN([Disabling Desktop GL support])
@@ -1042,7 +1042,7 @@ case $host in
     fi
 
     if test "x$HAVE_GL" = "xyes"; then
-      if test "$NEED_GL" != "xno"; then
+      if test "x$NEED_GL" != "xno"; then
         if test "x$HAVE_WGL" = "xyes"; then
           if test "$NEED_WGL" != "xno"; then
             GL_LIBS="$GL_LIBS -lgdi32 -lopengl32"
@@ -1398,12 +1398,13 @@ AG_GST_CHECK_FEATURE(DIRECTSOUND, [DirectSound], directsoundsrc, [
   save_LIBS="$LIBS"
   CFLAGS="$CFLAGS $DIRECTX_CFLAGS"
   LDFLAGS="$LDFLAGS $DIRECTX_LDFLAGS"
-  LIBS="$LIBS -ldsound -ldxerr9 -luser32"
+  LIBS="$LIBS -lwinmm -ldsound -ldxerr9 -luser32"
   AC_MSG_CHECKING(for DirectSound LDFLAGS)
   AC_LINK_IFELSE([AC_LANG_PROGRAM([[
 #include <windows.h>
 #include <dxerr9.h>
 #include <dsound.h>
+#include <mmsystem.h>
 ]], [[
   DXGetErrorString9 (0);
   DirectSoundCreate(NULL, NULL, NULL);
@@ -1417,7 +1418,7 @@ AG_GST_CHECK_FEATURE(DIRECTSOUND, [DirectSound], directsoundsrc, [
 
   if test "x$HAVE_DIRECTSOUND" = "xyes";  then
     dnl this is much more than we want
-    DIRECTSOUND_LIBS="-ldsound -ldxerr9 -luser32"
+    DIRECTSOUND_LIBS="-lwinmm -ldsound -ldxerr9 -luser32"
     AC_SUBST(DIRECTX_CFLAGS)
     AC_SUBST(DIRECTX_LDFLAGS)
     AC_SUBST(DIRECTSOUND_LIBS)
@@ -1502,41 +1503,6 @@ AG_GST_CHECK_FEATURE(DIRECT3D, [Direct3D plug-in], direct3dsink, [
     AC_SUBST(DIRECT3D_LIBS)
   fi
   AC_SUBST(HAVE_DIRECT3D)
-])
-
-dnl DirectDraw
-translit(dnm, m, l) AM_CONDITIONAL(USE_DIRECTDRAW, true)
-AG_GST_CHECK_FEATURE(DIRECTDRAW, [DirectDraw plug-in], directdrawsink, [
-  HAVE_DIRECTDRAW="no"
-  save_CFLAGS="$CFLAGS"
-  save_LDFLAGS="$LDFLAGS"
-  save_LIBS="$LIBS"
-  CFLAGS="$CFLAGS $DIRECTX_CFLAGS"
-  LDFLAGS="$LDFLAGS $DIRECTX_LDFLAGS"
-  LIBS="$LIBS -lddraw -lgdi32"
-  AC_MSG_CHECKING(for DirectDraw LDFLAGS)
-  AC_LINK_IFELSE([AC_LANG_PROGRAM([[
-#include <windows.h>
-#include <ddraw.h>
-]], [[
-  GetStockObject(0);
-  DirectDrawCreate(NULL, NULL, NULL);
-]])],
-    [HAVE_DIRECTDRAW="yes"],
-    [HAVE_DIRECTDRAW="no"])
-  AC_MSG_RESULT($HAVE_DIRECTDRAW)
-  CFLAGS=$save_CFLAGS
-  LDFLAGS=$save_LDFLAGS
-  LIBS=$save_LIBS
-
-  if test "x$HAVE_DIRECTDRAW" = "xyes";  then
-    dnl this is much more than we want
-    DIRECTDRAW_LIBS="-lddraw -ldxguid -lgdi32"
-    AC_SUBST(DIRECTX_CFLAGS)
-    AC_SUBST(DIRECTX_LDFLAGS)
-    AC_SUBST(DIRECTDRAW_LIBS)
-  fi
-  AC_SUBST(HAVE_DIRECTDRAW)
 ])
 
 dnl winscreencap
@@ -1666,22 +1632,6 @@ AG_GST_CHECK_FEATURE(BLUEZ, [Bluez], bluez, [
     PKG_CHECK_MODULES([DBUS], [dbus-1], [HAVE_BLUEZ=yes], [HAVE_BLUEZ=no])
   ])
 ])
-
-dnl *** OS X videosrc ***
-translit(dnm, m, l) AM_CONDITIONAL(USE_OSX_VIDEO, true)
-HAVE_OSX_VIDEO="no"
-AG_GST_CHECK_FEATURE(OSX_VIDEO, [OSX video], osxvideosrc, [
-  AC_CHECK_TYPE([SeqGrabComponent], HAVE_OSX_VIDEO="yes", HAVE_OSX_VIDEO="no",
-      [#include <Quicktime/Quicktime.h>])
-])
-dnl in case header Quicktime/Quicktime.h is found on other platforms
-case "$host" in
-  *-*darwin*)
-    ;;
-  *)
-    HAVE_OSX_VIDEO="no"
-    ;;
-esac
 
 dnl *** OS/X AVCVideoServices ***
 translit(dnm, m, l) AM_CONDITIONAL(USE_AVC, true)
@@ -2189,6 +2139,18 @@ AG_GST_CHECK_FEATURE(SRTP, [srtp library], srtp, [
   AC_SUBST(SRTP_CFLAGS)
 ])
 
+dnl *** dtls ***
+translit(dnm, m, l) AM_CONDITIONAL(USE_DTLS, true)
+AG_GST_CHECK_FEATURE(DTLS, [DTLS plugin], dtls, [
+  PKG_CHECK_MODULES(DTLS, [ openssl >= 0.9.5  libcrypto ], [
+    HAVE_DTLS="yes"
+    AC_SUBST(DTLS_CFLAGS)
+    AC_SUBST(DTLS_LIBS)
+  ], [
+    HAVE_DTLS="no"
+  ])
+])
+
 dnl *** linsys ***
 translit(dnm, m, l) AM_CONDITIONAL(USE_LINSYS, true)
 AG_GST_CHECK_FEATURE(LINSYS, [Linear Systems SDI plugin], linsys, [
@@ -2486,15 +2448,26 @@ AG_GST_CHECK_FEATURE(OPENCV, [opencv plugins], opencv, [
     AC_LANG([C++])
     OLD_CPPFLAGS=$CPPFLAGS
     CPPFLAGS=$OPENCV_CFLAGS
-    AC_CHECK_HEADERS([highgui.h opencv2/highgui/highgui_c.h])
+    something_not_found=no
+    AC_CHECK_HEADERS([opencv2/contrib/contrib.hpp \
+                      opencv2/core/core_c.h \
+                      opencv2/core/types_c.h \
+                      opencv2/core/version.hpp \
+                      opencv2/highgui/highgui_c.h \
+                      opencv2/imgproc/imgproc.hpp \
+                      opencv2/imgproc/imgproc_c.h \
+                      opencv2/legacy/compat.hpp \
+                      opencv2/legacy/legacy.hpp \
+                      opencv2/objdetect/objdetect.hpp \
+                      opencv2/video/background_segm.hpp], [], [something_not_found=yes])
     CPPFLAGS=$OLD_CPPFLAGS
     AC_LANG([C])
 
-    if test $ac_cv_header_highgui_h = "yes" -o $ac_cv_header_opencv2_highgui_highgui_c_h = "yes" ; then
-      HAVE_OPENCV="yes"
-    else
-      AC_MSG_RESULT([neither highgui.h nor opencv2/highgui/highgui_c.h could not be found])
+    if test $something_not_found = "yes"; then
+      AC_MSG_RESULT([not all opencv2 headers were found])
       HAVE_OPENCV="no"
+    else
+      HAVE_OPENCV="yes"
     fi
   ], [
     HAVE_OPENCV="no"
@@ -2515,7 +2488,7 @@ AG_GST_CHECK_FEATURE(OPENEXR, [openexr library], openexr, [
 dnl *** openh264 ***
 translit(dnm, m, l) AM_CONDITIONAL(USE_OPENH264, true)
 AG_GST_CHECK_FEATURE(OPENH264, [openh264 library], openh264, [
-  AG_GST_PKG_CHECK_MODULES(OPENH264, openh264)
+  AG_GST_PKG_CHECK_MODULES(OPENH264, openh264 >= 1.3.0)
 ])
 
 dnl *** OpenJPEG ***
@@ -3066,6 +3039,7 @@ AM_CONDITIONAL(USE_UVCH264, false)
 AM_CONDITIONAL(USE_WEBP, false)
 AM_CONDITIONAL(USE_OPENH264, false)
 AM_CONDITIONAL(USE_X265, false)
+AM_CONDITIONAL(USE_DTLS, false)
 
 fi dnl of EXT plugins
 
@@ -3253,7 +3227,6 @@ sys/avc/Makefile
 sys/bluez/Makefile
 sys/d3dvideosink/Makefile
 sys/decklink/Makefile
-sys/directdraw/Makefile
 sys/directsound/Makefile
 sys/dshowsrcwrapper/Makefile
 sys/dshowvideosink/Makefile
@@ -3261,7 +3234,6 @@ sys/dvb/Makefile
 sys/fbdev/Makefile
 sys/linsys/Makefile
 sys/opensles/Makefile
-sys/osxvideo/Makefile
 sys/shm/Makefile
 sys/uvch264/Makefile
 sys/vcd/Makefile
@@ -3275,6 +3247,7 @@ tests/Makefile
 tests/check/Makefile
 tests/files/Makefile
 tests/examples/Makefile
+tests/examples/avsamplesink/Makefile
 tests/examples/camerabin2/Makefile
 tests/examples/directfb/Makefile
 tests/examples/gl/Makefile
@@ -3364,6 +3337,7 @@ ext/webp/Makefile
 ext/x265/Makefile
 ext/xvid/Makefile
 ext/zbar/Makefile
+ext/dtls/Makefile
 po/Makefile.in
 docs/Makefile
 docs/plugins/Makefile

@@ -61,15 +61,13 @@ struct _GstGLImageSink
 
     //caps
     GstVideoInfo info;
-    GstCaps *gl_caps;
 
     GstGLDisplay *display;
     GstGLContext *context;
     GstGLContext *other_context;
     gboolean handle_events;
+    gboolean ignore_alpha;
 
-    GstGLUpload *upload;
-    GstGLColorConvert *convert;
     guint      next_tex;
     GstBuffer *next_buffer;
 
@@ -101,6 +99,7 @@ struct _GstGLImageSinkClass
 };
 
 GType gst_glimage_sink_get_type(void);
+GType gst_gl_image_sink_bin_get_type(void);
 
 G_END_DECLS
 

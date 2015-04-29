@@ -900,7 +900,8 @@ gst_ks_video_src_timestamp_buffer (GstKsVideoSrc * self, GstBuffer * buf,
 
   GST_BUFFER_OFFSET (buf) = priv->offset;
   GST_BUFFER_OFFSET_END (buf) = GST_BUFFER_OFFSET (buf) + 1;
-  GST_BUFFER_TIMESTAMP (buf) = timestamp;
+  GST_BUFFER_PTS (buf) = timestamp;
+  GST_BUFFER_DTS (buf) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DURATION (buf) = duration;
 
   return TRUE;
@@ -950,7 +951,6 @@ gst_ks_video_src_create (GstPushSrc * pushsrc, GstBuffer ** buf)
   GstClockTime presentation_time;
   gulong error_code;
   gchar *error_str;
-  GstMapInfo info;
 
   g_assert (priv->device != NULL);
 
@@ -987,9 +987,11 @@ gst_ks_video_src_create (GstPushSrc * pushsrc, GstBuffer ** buf)
   if (G_UNLIKELY (priv->do_stats))
     gst_ks_video_src_update_statistics (self);
 
-  gst_buffer_map (*buf, &info, GST_MAP_WRITE);
-  gst_ks_video_device_postprocess_frame (priv->device, info.data, info.size);
-  gst_buffer_unmap (*buf, &info);
+  if (!gst_ks_video_device_postprocess_frame (priv->device, *buf)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Postprocessing failed"),
+        ("Postprocessing failed"));
+    return GST_FLOW_ERROR;
+  }
 
   return GST_FLOW_OK;
 

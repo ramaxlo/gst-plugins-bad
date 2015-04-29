@@ -37,65 +37,44 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
 
 static GstStaticPadTemplate gst_gl_filter_src_pad_template =
-    GST_STATIC_PAD_TEMPLATE ("src",
+GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_GL_MEMORY,
-            "RGBA") "; "
-#if GST_GL_HAVE_PLATFORM_EGL
-        GST_VIDEO_CAPS_MAKE_WITH_FEATURES (GST_CAPS_FEATURE_MEMORY_EGL_IMAGE,
-            "RGBA") "; "
-#endif
-        GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-        (GST_CAPS_FEATURE_META_GST_VIDEO_GL_TEXTURE_UPLOAD_META,
-            "RGBA") "; " GST_VIDEO_CAPS_MAKE (GST_GL_COLOR_CONVERT_FORMATS))
+            "RGBA"))
     );
 
 static GstStaticPadTemplate gst_gl_filter_sink_pad_template =
-    GST_STATIC_PAD_TEMPLATE ("sink",
+GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
         (GST_CAPS_FEATURE_MEMORY_GL_MEMORY,
-            "RGBA") "; "
-#if GST_GL_HAVE_PLATFORM_EGL
-        GST_VIDEO_CAPS_MAKE_WITH_FEATURES (GST_CAPS_FEATURE_MEMORY_EGL_IMAGE,
-            "RGBA") "; "
-#endif
-        GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-        (GST_CAPS_FEATURE_META_GST_VIDEO_GL_TEXTURE_UPLOAD_META, "RGBA") "; "
-        GST_VIDEO_CAPS_MAKE (GST_GL_COLOR_CONVERT_FORMATS))
+            "RGBA"))
     );
 
 /* Properties */
 enum
 {
   PROP_0,
-  PROP_CONTEXT
 };
 
-#define DEBUG_INIT \
-  GST_DEBUG_CATEGORY_INIT (gst_gl_filter_debug, "glfilter", 0, "glfilter element");
 #define gst_gl_filter_parent_class parent_class
-G_DEFINE_TYPE_WITH_CODE (GstGLFilter, gst_gl_filter, GST_TYPE_BASE_TRANSFORM,
-    DEBUG_INIT);
+G_DEFINE_TYPE_WITH_CODE (GstGLFilter, gst_gl_filter, GST_TYPE_GL_BASE_FILTER,
+    GST_DEBUG_CATEGORY_INIT (gst_gl_filter_debug, "glfilter", 0,
+        "glfilter element"););
 
 static void gst_gl_filter_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_gl_filter_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 
-static void gst_gl_filter_set_context (GstElement * element,
-    GstContext * context);
-static gboolean gst_gl_filter_query (GstBaseTransform * trans,
-    GstPadDirection direction, GstQuery * query);
 static GstCaps *gst_gl_filter_transform_caps (GstBaseTransform * bt,
     GstPadDirection direction, GstCaps * caps, GstCaps * filter);
 static GstCaps *gst_gl_filter_fixate_caps (GstBaseTransform * bt,
     GstPadDirection direction, GstCaps * caps, GstCaps * othercaps);
 static void gst_gl_filter_reset (GstGLFilter * filter);
-static gboolean gst_gl_filter_start (GstBaseTransform * bt);
 static gboolean gst_gl_filter_stop (GstBaseTransform * bt);
 static gboolean gst_gl_filter_get_unit_size (GstBaseTransform * trans,
     GstCaps * caps, gsize * size);
@@ -107,10 +86,8 @@ static gboolean gst_gl_filter_decide_allocation (GstBaseTransform * trans,
     GstQuery * query);
 static gboolean gst_gl_filter_set_caps (GstBaseTransform * bt, GstCaps * incaps,
     GstCaps * outcaps);
-
-/* GstGLContextThreadFunc */
-static void gst_gl_filter_start_gl (GstGLContext * context, gpointer data);
-static void gst_gl_filter_stop_gl (GstGLContext * context, gpointer data);
+static gboolean gst_gl_filter_gl_start (GstGLBaseFilter * filter);
+static void gst_gl_filter_gl_stop (GstGLBaseFilter * filter);
 
 static void
 gst_gl_filter_class_init (GstGLFilterClass * klass)
@@ -128,8 +105,6 @@ gst_gl_filter_class_init (GstGLFilterClass * klass)
       gst_gl_filter_transform_caps;
   GST_BASE_TRANSFORM_CLASS (klass)->fixate_caps = gst_gl_filter_fixate_caps;
   GST_BASE_TRANSFORM_CLASS (klass)->transform = gst_gl_filter_transform;
-  GST_BASE_TRANSFORM_CLASS (klass)->query = gst_gl_filter_query;
-  GST_BASE_TRANSFORM_CLASS (klass)->start = gst_gl_filter_start;
   GST_BASE_TRANSFORM_CLASS (klass)->stop = gst_gl_filter_stop;
   GST_BASE_TRANSFORM_CLASS (klass)->set_caps = gst_gl_filter_set_caps;
   GST_BASE_TRANSFORM_CLASS (klass)->propose_allocation =
@@ -138,35 +113,20 @@ gst_gl_filter_class_init (GstGLFilterClass * klass)
       gst_gl_filter_decide_allocation;
   GST_BASE_TRANSFORM_CLASS (klass)->get_unit_size = gst_gl_filter_get_unit_size;
 
-  element_class->set_context = gst_gl_filter_set_context;
+  GST_GL_BASE_FILTER_CLASS (klass)->gl_start = gst_gl_filter_gl_start;
+  GST_GL_BASE_FILTER_CLASS (klass)->gl_stop = gst_gl_filter_gl_stop;
 
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&gst_gl_filter_src_pad_template));
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&gst_gl_filter_sink_pad_template));
-
-  g_object_class_install_property (gobject_class, PROP_CONTEXT,
-      g_param_spec_object ("context",
-          "OpenGL context",
-          "Get OpenGL context",
-          GST_GL_TYPE_CONTEXT, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
-
-  klass->supported_gl_api = GST_GL_API_ANY;
-  klass->set_caps = NULL;
-  klass->filter = NULL;
-  klass->display_init_cb = NULL;
-  klass->display_reset_cb = NULL;
-  klass->onInitFBO = NULL;
-  klass->onStart = NULL;
-  klass->onStop = NULL;
-  klass->onReset = NULL;
-  klass->filter_texture = NULL;
 }
 
 static void
 gst_gl_filter_init (GstGLFilter * filter)
 {
-  gst_gl_filter_reset (filter);
+  filter->draw_attr_position_loc = -1;
+  filter->draw_attr_texture_loc = -1;
 }
 
 static void
@@ -184,12 +144,7 @@ static void
 gst_gl_filter_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec)
 {
-  GstGLFilter *filter = GST_GL_FILTER (object);
-
   switch (prop_id) {
-    case PROP_CONTEXT:
-      g_value_set_object (value, filter->context);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -197,179 +152,82 @@ gst_gl_filter_get_property (GObject * object, guint prop_id,
 }
 
 static void
-gst_gl_filter_set_context (GstElement * element, GstContext * context)
-{
-  GstGLFilter *filter = GST_GL_FILTER (element);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
-  gst_gl_handle_set_context (element, context, &filter->display,
-      &filter->other_context);
-  if (filter->display)
-    gst_gl_display_filter_gl_api (filter->display,
-        filter_class->supported_gl_api);
-}
-
-static gboolean
-gst_gl_filter_query (GstBaseTransform * trans, GstPadDirection direction,
-    GstQuery * query)
-{
-  GstGLFilter *filter = GST_GL_FILTER (trans);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
-  switch (GST_QUERY_TYPE (query)) {
-    case GST_QUERY_ALLOCATION:
-    {
-      if (direction == GST_PAD_SINK
-          && gst_base_transform_is_passthrough (trans))
-        return gst_pad_peer_query (GST_BASE_TRANSFORM_SRC_PAD (trans), query);
-      break;
-    }
-    case GST_QUERY_CONTEXT:
-    {
-      gboolean ret = gst_gl_handle_context_query ((GstElement *) filter, query,
-          &filter->display, &filter->other_context);
-      if (filter->display)
-        gst_gl_display_filter_gl_api (filter->display,
-            filter_class->supported_gl_api);
-      return ret;
-    }
-    default:
-      break;
-  }
-
-  return GST_BASE_TRANSFORM_CLASS (parent_class)->query (trans, direction,
-      query);;
-}
-
-static void
 gst_gl_filter_reset (GstGLFilter * filter)
 {
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
   gst_caps_replace (&filter->out_caps, NULL);
 
-  if (filter->upload) {
-    gst_object_unref (filter->upload);
-    filter->upload = NULL;
+  if (filter->pool) {
+    gst_object_unref (filter->pool);
+    filter->pool = NULL;
   }
-
-  if (filter->in_convert) {
-    gst_object_unref (filter->in_convert);
-    filter->in_convert = NULL;
-  }
-
-  if (filter->download) {
-    gst_object_unref (filter->download);
-    filter->download = NULL;
-  }
-
-  if (filter->uploaded_buffer) {
-    gst_buffer_unref (filter->uploaded_buffer);
-    filter->uploaded_buffer = NULL;
-  }
-
-  if (filter->context) {
-    if (filter_class->onReset)
-      filter_class->onReset (filter);
-
-    if (filter_class->display_reset_cb != NULL) {
-      gst_gl_context_thread_add (filter->context, gst_gl_filter_stop_gl,
-          filter);
-    }
-    //blocking call, delete the FBO
-    if (filter->fbo != 0) {
-      gst_gl_context_del_fbo (filter->context, filter->fbo,
-          filter->depthbuffer);
-    }
-
-    if (filter->in_tex_id) {
-      gst_gl_context_del_texture (filter->context, &filter->in_tex_id);
-      filter->in_tex_id = 0;
-    }
-
-    if (filter->out_tex_id) {
-      gst_gl_context_del_texture (filter->context, &filter->out_tex_id);
-      filter->out_tex_id = 0;
-    }
-
-    gst_object_unref (filter->context);
-    filter->context = NULL;
-  }
-
-  if (filter->display) {
-    gst_object_unref (filter->display);
-    filter->display = NULL;
-  }
-
-  filter->fbo = 0;
-  filter->depthbuffer = 0;
-  filter->default_shader = NULL;
-  filter->draw_attr_position_loc = -1;
-  filter->draw_attr_texture_loc = -1;
-  if (filter->other_context)
-    gst_object_unref (filter->other_context);
-  filter->other_context = NULL;
-
-  if (filter->context)
-    gst_object_unref (filter->context);
-  filter->context = NULL;
-
-  if (filter->in_converted_caps) {
-    gst_caps_unref (filter->in_converted_caps);
-    filter->in_converted_caps = NULL;
-  }
-}
-
-static gboolean
-gst_gl_filter_start (GstBaseTransform * bt)
-{
-  GstGLFilter *filter = GST_GL_FILTER (bt);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
-  if (!gst_gl_ensure_element_data (filter, &filter->display,
-          &filter->other_context))
-    return FALSE;
-
-  gst_gl_display_filter_gl_api (filter->display,
-      filter_class->supported_gl_api);
-
-  if (filter_class->onStart)
-    filter_class->onStart (filter);
-
-  return TRUE;
 }
 
 static gboolean
 gst_gl_filter_stop (GstBaseTransform * bt)
 {
   GstGLFilter *filter = GST_GL_FILTER (bt);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
-  if (filter_class->onStop)
-    filter_class->onStop (filter);
 
   gst_gl_filter_reset (filter);
 
+  return GST_BASE_TRANSFORM_CLASS (parent_class)->stop (bt);
+}
+
+static gboolean
+gst_gl_filter_gl_start (GstGLBaseFilter * base_filter)
+{
+  GstGLFilter *filter = GST_GL_FILTER (base_filter);
+  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
+  gint out_width, out_height;
+  GError *error = NULL;
+
+  out_width = GST_VIDEO_INFO_WIDTH (&filter->out_info);
+  out_height = GST_VIDEO_INFO_HEIGHT (&filter->out_info);
+
+  if (filter->fbo) {
+    gst_gl_context_del_fbo (context, filter->fbo, filter->depthbuffer);
+    filter->fbo = 0;
+    filter->depthbuffer = 0;
+  }
+  //blocking call, generate a FBO
+  if (!gst_gl_context_gen_fbo (context, out_width, out_height,
+          &filter->fbo, &filter->depthbuffer))
+    goto context_error;
+
+  if (filter_class->display_init_cb)
+    filter_class->display_init_cb (filter);
+
+  if (filter_class->init_fbo) {
+    if (!filter_class->init_fbo (filter))
+      goto error;
+  }
+
   return TRUE;
+
+context_error:
+  {
+    GST_ELEMENT_ERROR (filter, RESOURCE, NOT_FOUND, ("%s", error->message),
+        (NULL));
+    return FALSE;
+  }
+error:
+  {
+    GST_ELEMENT_ERROR (filter, LIBRARY, INIT,
+        ("Subclass failed to initialize."), (NULL));
+    return FALSE;
+  }
 }
 
 static void
-gst_gl_filter_start_gl (GstGLContext * context, gpointer data)
+gst_gl_filter_gl_stop (GstGLBaseFilter * base_filter)
 {
-  GstGLFilter *filter = GST_GL_FILTER (data);
+  GstGLFilter *filter = GST_GL_FILTER (base_filter);
   GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-
-  filter_class->display_init_cb (filter);
-}
-
-static void
-gst_gl_filter_stop_gl (GstGLContext * context, gpointer data)
-{
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
   const GstGLFuncs *gl = context->gl_vtable;
-  GstGLFilter *filter = GST_GL_FILTER (data);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
 
-  filter_class->display_reset_cb (filter);
+  if (filter_class->display_reset_cb)
+    filter_class->display_reset_cb (filter);
 
   if (filter->vao) {
     gl->DeleteVertexArrays (1, &filter->vao);
@@ -380,6 +238,16 @@ gst_gl_filter_stop_gl (GstGLContext * context, gpointer data)
     gl->DeleteBuffers (1, &filter->vertex_buffer);
     filter->vertex_buffer = 0;
   }
+
+  if (filter->fbo != 0) {
+    gst_gl_context_del_fbo (context, filter->fbo, filter->depthbuffer);
+  }
+
+  filter->fbo = 0;
+  filter->depthbuffer = 0;
+  filter->default_shader = NULL;
+  filter->draw_attr_position_loc = -1;
+  filter->draw_attr_texture_loc = -1;
 }
 
 static GstCaps *
@@ -616,6 +484,7 @@ gst_gl_filter_fixate_caps (GstBaseTransform * bt,
               &to_par_n, &to_par_d)) {
         GST_ELEMENT_ERROR (bt, CORE, NEGOTIATION, (NULL),
             ("Error calculating the output scaled size - integer overflow"));
+        gst_structure_free (tmp);
         goto done;
       }
 
@@ -705,36 +574,9 @@ done:
   return othercaps;
 }
 
-
-static GstCaps *
-gst_gl_filter_set_caps_features (const GstCaps * caps,
-    const gchar * feature_name)
-{
-  GstCaps *tmp = gst_caps_copy (caps);
-  guint n = gst_caps_get_size (tmp);
-  guint i = 0;
-
-  for (i = 0; i < n; i++) {
-    GstCapsFeatures *features = gst_caps_get_features (tmp, i);
-    if (features) {
-      guint n_f = gst_caps_features_get_size (features);
-      guint j = 0;
-      for (j = 0; j < n_f; j++) {
-        gst_caps_features_remove_id (features,
-            gst_caps_features_get_nth_id (features, j));
-      }
-    }
-
-    gst_caps_features_add (features, feature_name);
-    gst_caps_set_simple (tmp, "format", G_TYPE_STRING, "RGBA", NULL);
-  }
-
-  return tmp;
-}
-
 /* copies the given caps */
 static GstCaps *
-gst_gl_filter_caps_remove_format_info (GstCaps * caps)
+gst_gl_filter_caps_remove_size (GstCaps * caps)
 {
   GstStructure *st;
   GstCapsFeatures *f;
@@ -754,12 +596,6 @@ gst_gl_filter_caps_remove_format_info (GstCaps * caps)
       continue;
 
     st = gst_structure_copy (st);
-    /* Only remove format info for the cases when we can actually convert */
-    if (!gst_caps_features_is_any (f)
-        && gst_caps_features_is_equal (f,
-            GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY))
-      gst_structure_remove_fields (st, "format", "colorimetry", "chroma-site",
-          NULL);
     gst_structure_remove_fields (st, "width", "height", NULL);
 
     gst_caps_append_structure_full (res, st, gst_caps_features_copy (f));
@@ -769,36 +605,33 @@ gst_gl_filter_caps_remove_format_info (GstCaps * caps)
 }
 
 static GstCaps *
+gst_gl_filter_set_caps_features (const GstCaps * caps,
+    const gchar * feature_name)
+{
+  GstCaps *ret = gst_gl_caps_replace_all_caps_features (caps, feature_name);
+  gst_caps_set_simple (ret, "format", G_TYPE_STRING, "RGBA", NULL);
+  return ret;
+}
+
+static GstCaps *
 gst_gl_filter_transform_caps (GstBaseTransform * bt,
-    GstPadDirection direction, GstCaps * caps, GstCaps * filter)
+    GstPadDirection direction, GstCaps * caps, GstCaps * filter_caps)
 {
   GstCaps *tmp = NULL;
   GstCaps *result = NULL;
-  GstCaps *glcaps = gst_gl_filter_set_caps_features (caps,
-      GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
-#if GST_GL_HAVE_PLATFORM_EGL
-  GstCaps *eglcaps = gst_gl_filter_set_caps_features (caps,
-      GST_CAPS_FEATURE_MEMORY_EGL_IMAGE);
-#endif
-  GstCaps *uploadcaps = gst_gl_filter_set_caps_features (caps,
-      GST_CAPS_FEATURE_META_GST_VIDEO_GL_TEXTURE_UPLOAD_META);
-  GstCaps *raw_caps =
-      gst_caps_from_string (GST_VIDEO_CAPS_MAKE (GST_GL_COLOR_CONVERT_FORMATS));
 
-  tmp = gst_caps_new_empty ();
+  result = gst_gl_filter_caps_remove_size (caps);
+  tmp = result;
+  GST_DEBUG_OBJECT (bt, "size removal returned caps %" GST_PTR_FORMAT, tmp);
 
-  tmp = gst_caps_merge (tmp, gst_gl_filter_caps_remove_format_info (glcaps));
-#if GST_GL_HAVE_PLATFORM_EGL
-  tmp = gst_caps_merge (tmp, gst_gl_filter_caps_remove_format_info (eglcaps));
-#endif
-  tmp =
-      gst_caps_merge (tmp, gst_gl_filter_caps_remove_format_info (uploadcaps));
-  tmp = gst_caps_merge (tmp, gst_gl_filter_caps_remove_format_info (raw_caps));
+  result =
+      gst_gl_filter_set_caps_features (tmp, GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
+  gst_caps_unref (tmp);
+  tmp = result;
 
-  tmp = gst_caps_merge (tmp, gst_gl_filter_caps_remove_format_info (caps));
-
-  if (filter) {
-    result = gst_caps_intersect_full (filter, tmp, GST_CAPS_INTERSECT_FIRST);
+  if (filter_caps) {
+    result =
+        gst_caps_intersect_full (filter_caps, tmp, GST_CAPS_INTERSECT_FIRST);
     gst_caps_unref (tmp);
   } else {
     result = tmp;
@@ -808,7 +641,6 @@ gst_gl_filter_transform_caps (GstBaseTransform * bt,
 
   return result;
 }
-
 
 static gboolean
 gst_gl_filter_get_unit_size (GstBaseTransform * trans, GstCaps * caps,
@@ -868,133 +700,59 @@ gst_gl_filter_propose_allocation (GstBaseTransform * trans,
     GstQuery * decide_query, GstQuery * query)
 {
   GstGLFilter *filter = GST_GL_FILTER (trans);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
-  GstBufferPool *pool;
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
   GstStructure *config;
-  GstCaps *caps, *decide_caps;
+  GstCaps *caps;
   guint size;
   gboolean need_pool;
-  GError *error = NULL;
-  GstStructure *gl_context;
-  gchar *platform, *gl_apis;
-  gpointer handle;
-  GstAllocator *allocator = NULL;
-  GstAllocationParams params;
 
   gst_query_parse_allocation (query, &caps, &need_pool);
 
   if (caps == NULL)
     goto no_caps;
 
-  if ((pool = filter->pool))
-    gst_object_ref (pool);
+  if (need_pool) {
+    if (filter->pool) {
+      GstCaps *pcaps;
 
-  if (pool != NULL) {
-    GstCaps *pcaps;
+      /* we had a pool, check caps */
+      GST_DEBUG_OBJECT (filter, "check existing pool caps");
+      config = gst_buffer_pool_get_config (filter->pool);
+      gst_buffer_pool_config_get_params (config, &pcaps, &size, NULL, NULL);
 
-    /* we had a pool, check caps */
-    GST_DEBUG_OBJECT (filter, "check existing pool caps");
-    config = gst_buffer_pool_get_config (pool);
-    gst_buffer_pool_config_get_params (config, &pcaps, &size, NULL, NULL);
-
-    if (!gst_caps_is_equal (caps, pcaps)) {
-      GST_DEBUG_OBJECT (filter, "pool has different caps");
-      /* different caps, we can't use this pool */
-      gst_object_unref (pool);
-      pool = NULL;
-    }
-    gst_structure_free (config);
-  }
-
-  if (!gst_gl_ensure_element_data (filter, &filter->display,
-          &filter->other_context))
-    return FALSE;
-
-  gst_gl_display_filter_gl_api (filter->display,
-      filter_class->supported_gl_api);
-
-  if (!filter->context) {
-    filter->context = gst_gl_context_new (filter->display);
-    if (!gst_gl_context_create (filter->context, filter->other_context, &error))
-      goto context_error;
-  }
-
-  if (pool == NULL && need_pool) {
-    GstVideoInfo info;
-    GstBufferPool *decide_pool = NULL;
-
-    if (!gst_video_info_from_caps (&info, caps))
-      goto invalid_caps;
-
-    if (decide_query) {
-      gst_query_parse_allocation (decide_query, &decide_caps, NULL);
-      decide_pool = gst_base_transform_get_buffer_pool (trans);
-    }
-
-    if (decide_pool && GST_IS_GL_BUFFER_POOL (decide_pool)
-        && gst_caps_is_equal_fixed (decide_caps, caps)) {
-      config = gst_buffer_pool_get_config (decide_pool);
-      gst_buffer_pool_config_get_params (config, NULL, &size, NULL, NULL);
+      if (!gst_caps_is_equal (caps, pcaps)) {
+        GST_DEBUG_OBJECT (filter, "pool has different caps");
+        /* different caps, we can't use this pool */
+        gst_object_unref (filter->pool);
+        filter->pool = NULL;
+      }
       gst_structure_free (config);
+    }
 
-      pool = decide_pool;
-    } else {
-      GST_DEBUG_OBJECT (filter, "create new pool");
-      if (decide_pool)
-        gst_object_unref (decide_pool);
-      pool = gst_gl_buffer_pool_new (filter->context);
+    if (filter->pool == NULL) {
+      GstVideoInfo info;
+
+      if (!gst_video_info_from_caps (&info, caps))
+        goto invalid_caps;
 
       /* the normal size of a frame */
       size = info.size;
 
-      config = gst_buffer_pool_get_config (pool);
+      GST_DEBUG_OBJECT (filter, "create new pool");
+      filter->pool = gst_gl_buffer_pool_new (context);
+
+      config = gst_buffer_pool_get_config (filter->pool);
       gst_buffer_pool_config_set_params (config, caps, size, 0, 0);
-      if (!gst_buffer_pool_set_config (pool, config))
+
+      if (!gst_buffer_pool_set_config (filter->pool, config))
         goto config_failed;
     }
-  }
-  /* we need at least 2 buffer because we hold on to the last one */
-  if (pool) {
-    gst_query_add_allocation_pool (query, pool, size, 1, 0);
-    gst_object_unref (pool);
+
+    gst_query_add_allocation_pool (query, filter->pool, size, 1, 0);
   }
 
-  /* we also support various metadata */
-  gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, 0);
-  if (filter->context->gl_vtable->FenceSync)
+  if (context->gl_vtable->FenceSync)
     gst_query_add_allocation_meta (query, GST_GL_SYNC_META_API_TYPE, 0);
-
-  gl_apis = gst_gl_api_to_string (gst_gl_context_get_gl_api (filter->context));
-  platform =
-      gst_gl_platform_to_string (gst_gl_context_get_gl_platform
-      (filter->context));
-  handle = (gpointer) gst_gl_context_get_gl_context (filter->context);
-
-  gl_context =
-      gst_structure_new ("GstVideoGLTextureUploadMeta", "gst.gl.GstGLContext",
-      GST_GL_TYPE_CONTEXT, filter->context, "gst.gl.context.handle",
-      G_TYPE_POINTER, handle, "gst.gl.context.type", G_TYPE_STRING, platform,
-      "gst.gl.context.apis", G_TYPE_STRING, gl_apis, NULL);
-  gst_query_add_allocation_meta (query,
-      GST_VIDEO_GL_TEXTURE_UPLOAD_META_API_TYPE, gl_context);
-
-  g_free (gl_apis);
-  g_free (platform);
-  gst_structure_free (gl_context);
-
-  gst_allocation_params_init (&params);
-
-  allocator = gst_allocator_find (GST_GL_MEMORY_ALLOCATOR);
-  gst_query_add_allocation_param (query, allocator, &params);
-  gst_object_unref (allocator);
-
-#if GST_GL_HAVE_PLATFORM_EGL
-  if (gst_gl_context_check_feature (filter->context, "EGL_KHR_image_base")) {
-    allocator = gst_allocator_find (GST_EGL_IMAGE_MEMORY_TYPE);
-    gst_query_add_allocation_param (query, allocator, &params);
-    gst_object_unref (allocator);
-  }
-#endif
 
   return TRUE;
 
@@ -1014,133 +772,28 @@ config_failed:
     GST_DEBUG_OBJECT (trans, "failed setting config");
     return FALSE;
   }
-context_error:
-  {
-    GST_ELEMENT_ERROR (trans, RESOURCE, NOT_FOUND, ("%s", error->message),
-        (NULL));
-    return FALSE;
-  }
 }
 
 static gboolean
 gst_gl_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
 {
-  GstGLFilter *filter = GST_GL_FILTER (trans);
-  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (filter);
+  GstGLContext *context;
   GstBufferPool *pool = NULL;
   GstStructure *config;
   GstCaps *caps;
   guint min, max, size;
   gboolean update_pool;
-  guint idx;
-  GError *error = NULL;
-  guint in_width, in_height, out_width, out_height;
-  GstGLContext *other_context = NULL;
-  gboolean same_downstream_gl_context = FALSE;
-
-  if (!gst_gl_ensure_element_data (filter, &filter->display,
-          &filter->other_context))
-    return FALSE;
-
-  gst_gl_display_filter_gl_api (filter->display,
-      filter_class->supported_gl_api);
-
-  if (gst_query_find_allocation_meta (query,
-          GST_VIDEO_GL_TEXTURE_UPLOAD_META_API_TYPE, &idx)) {
-    GstGLContext *context;
-    const GstStructure *upload_meta_params;
-    gpointer handle;
-    gchar *type;
-    gchar *apis;
-
-    gst_query_parse_nth_allocation_meta (query, idx, &upload_meta_params);
-    if (upload_meta_params) {
-      if (gst_structure_get (upload_meta_params, "gst.gl.GstGLContext",
-              GST_GL_TYPE_CONTEXT, &context, NULL) && context) {
-        GstGLContext *old = filter->context;
-
-        filter->context = context;
-        if (old)
-          gst_object_unref (old);
-        same_downstream_gl_context = TRUE;
-      } else if (gst_structure_get (upload_meta_params, "gst.gl.context.handle",
-              G_TYPE_POINTER, &handle, "gst.gl.context.type", G_TYPE_STRING,
-              &type, "gst.gl.context.apis", G_TYPE_STRING, &apis, NULL)
-          && handle) {
-        GstGLPlatform platform = GST_GL_PLATFORM_NONE;
-        GstGLAPI gl_apis;
-
-        GST_DEBUG ("got GL context handle 0x%p with type %s and apis %s",
-            handle, type, apis);
-
-        platform = gst_gl_platform_from_string (type);
-        gl_apis = gst_gl_api_from_string (apis);
-
-        if (gl_apis && platform)
-          other_context =
-              gst_gl_context_new_wrapped (filter->display, (guintptr) handle,
-              platform, gl_apis);
-      }
-    }
-  }
-
-  if (filter->other_context) {
-    if (!other_context) {
-      other_context = filter->other_context;
-    } else {
-      GST_ELEMENT_WARNING (filter, LIBRARY, SETTINGS,
-          ("%s", "Cannot share with more than one GL context"),
-          ("%s", "Cannot share with more than one GL context"));
-    }
-  }
-
-  if (!filter->context) {
-    filter->context = gst_gl_context_new (filter->display);
-    if (!gst_gl_context_create (filter->context, other_context, &error))
-      goto context_error;
-  }
-
-  in_width = GST_VIDEO_INFO_WIDTH (&filter->in_info);
-  in_height = GST_VIDEO_INFO_HEIGHT (&filter->in_info);
-  out_width = GST_VIDEO_INFO_WIDTH (&filter->out_info);
-  out_height = GST_VIDEO_INFO_HEIGHT (&filter->out_info);
-
-  if (filter->fbo) {
-    gst_gl_context_del_fbo (filter->context, filter->fbo, filter->depthbuffer);
-    filter->fbo = 0;
-    filter->depthbuffer = 0;
-  }
-
-  if (filter->in_tex_id) {
-    gst_gl_context_del_texture (filter->context, &filter->in_tex_id);
-    filter->in_tex_id = 0;
-  }
-
-  if (filter->out_tex_id) {
-    gst_gl_context_del_texture (filter->context, &filter->out_tex_id);
-    filter->out_tex_id = 0;
-  }
-  //blocking call, generate a FBO
-  if (!gst_gl_context_gen_fbo (filter->context, out_width, out_height,
-          &filter->fbo, &filter->depthbuffer))
-    goto context_error;
-
-  gst_gl_context_gen_texture (filter->context, &filter->in_tex_id,
-      GST_VIDEO_FORMAT_RGBA, in_width, in_height);
-
-  gst_gl_context_gen_texture (filter->context, &filter->out_tex_id,
-      GST_VIDEO_FORMAT_RGBA, out_width, out_height);
-
-  if (filter_class->display_init_cb != NULL) {
-    gst_gl_context_thread_add (filter->context, gst_gl_filter_start_gl, filter);
-  }
-
-  if (filter_class->onInitFBO) {
-    if (!filter_class->onInitFBO (filter))
-      goto error;
-  }
 
   gst_query_parse_allocation (query, &caps, NULL);
+  if (!caps)
+    return FALSE;
+
+  /* get gl context */
+  if (!GST_BASE_TRANSFORM_CLASS (parent_class)->decide_allocation (trans,
+          query))
+    return FALSE;
+
+  context = GST_GL_BASE_FILTER (trans)->context;
 
   if (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
@@ -1156,16 +809,12 @@ gst_gl_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
     update_pool = FALSE;
   }
 
-  if (!pool || (!same_downstream_gl_context
-          && gst_query_find_allocation_meta (query, GST_GL_SYNC_META_API_TYPE,
-              NULL)
-          && !gst_buffer_pool_has_option (pool,
-              GST_BUFFER_POOL_OPTION_GL_SYNC_META))) {
-    /* can't use this pool */
+  if (!pool || !GST_IS_GL_BUFFER_POOL (pool)) {
     if (pool)
       gst_object_unref (pool);
-    pool = gst_gl_buffer_pool_new (filter->context);
+    pool = gst_gl_buffer_pool_new (context);
   }
+
   config = gst_buffer_pool_get_config (pool);
 
   gst_buffer_pool_config_set_params (config, caps, size, min, max);
@@ -1173,15 +822,8 @@ gst_gl_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
   if (gst_query_find_allocation_meta (query, GST_GL_SYNC_META_API_TYPE, NULL))
     gst_buffer_pool_config_add_option (config,
         GST_BUFFER_POOL_OPTION_GL_SYNC_META);
-  gst_buffer_pool_config_add_option (config,
-      GST_BUFFER_POOL_OPTION_VIDEO_GL_TEXTURE_UPLOAD_META);
 
   gst_buffer_pool_set_config (pool, config);
-
-  if (filter->upload) {
-    gst_object_unref (filter->upload);
-    filter->upload = NULL;
-  }
 
   if (update_pool)
     gst_query_set_nth_allocation_pool (query, 0, pool, size, min, max);
@@ -1191,19 +833,6 @@ gst_gl_filter_decide_allocation (GstBaseTransform * trans, GstQuery * query)
   gst_object_unref (pool);
 
   return TRUE;
-
-context_error:
-  {
-    GST_ELEMENT_ERROR (trans, RESOURCE, NOT_FOUND, ("%s", error->message),
-        (NULL));
-    return FALSE;
-  }
-error:
-  {
-    GST_ELEMENT_ERROR (trans, LIBRARY, INIT,
-        ("Subclass failed to initialize."), (NULL));
-    return FALSE;
-  }
 }
 
 /**
@@ -1224,37 +853,11 @@ gst_gl_filter_filter_texture (GstGLFilter * filter, GstBuffer * inbuf,
   GstGLFilterClass *filter_class;
   guint in_tex, out_tex;
   GstVideoFrame gl_frame, out_frame;
-  GstVideoInfo gl_info;
   gboolean ret;
-  gboolean to_download =
-      gst_caps_features_is_equal (GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY,
-      gst_caps_get_features (filter->out_caps, 0));
-  GstMapFlags out_map_flags = GST_MAP_WRITE;
-  GstBuffer *upload_buffer;
 
   filter_class = GST_GL_FILTER_GET_CLASS (filter);
 
-  if (gst_gl_upload_perform_with_buffer (filter->upload, inbuf,
-          &upload_buffer) != GST_GL_UPLOAD_DONE) {
-    return FALSE;
-  }
-
-  if (filter->uploaded_buffer) {
-    gst_buffer_unref (filter->uploaded_buffer);
-    filter->uploaded_buffer = NULL;
-  }
-
-  filter->uploaded_buffer =
-      gst_gl_color_convert_perform (filter->in_convert, upload_buffer);
-
-  if (!filter->uploaded_buffer) {
-    ret = FALSE;
-    goto inbuf_error;
-  }
-
-  gst_video_info_from_caps (&gl_info, filter->in_converted_caps);
-
-  if (!gst_video_frame_map (&gl_frame, &gl_info, filter->uploaded_buffer,
+  if (!gst_video_frame_map (&gl_frame, &filter->in_info, inbuf,
           GST_MAP_READ | GST_MAP_GL)) {
     ret = FALSE;
     goto inbuf_error;
@@ -1262,30 +865,13 @@ gst_gl_filter_filter_texture (GstGLFilter * filter, GstBuffer * inbuf,
 
   in_tex = *(guint *) gl_frame.data[0];
 
-  to_download |= !gst_is_gl_memory (gst_buffer_peek_memory (outbuf, 0));
-
-  if (!to_download)
-    out_map_flags |= GST_MAP_GL;
-
   if (!gst_video_frame_map (&out_frame, &filter->out_info, outbuf,
-          out_map_flags)) {
+          GST_MAP_WRITE | GST_MAP_GL)) {
     ret = FALSE;
     goto unmap_out_error;
   }
 
-  if (!to_download) {
-    out_tex = *(guint *) out_frame.data[0];
-  } else {
-    GST_LOG ("Output Buffer does not contain correct memory, "
-        "attempting to wrap for download");
-
-    if (!filter->download)
-      filter->download = gst_gl_download_new (filter->context);
-
-    gst_gl_download_set_format (filter->download, &out_frame.info);
-
-    out_tex = filter->out_tex_id;
-  }
+  out_tex = *(guint *) out_frame.data[0];
 
   GST_DEBUG ("calling filter_texture with textures in:%i out:%i", in_tex,
       out_tex);
@@ -1293,21 +879,10 @@ gst_gl_filter_filter_texture (GstGLFilter * filter, GstBuffer * inbuf,
   g_assert (filter_class->filter_texture);
   ret = filter_class->filter_texture (filter, in_tex, out_tex);
 
-  if (to_download) {
-    if (!gst_gl_download_perform_with_data (filter->download, out_tex,
-            out_frame.data)) {
-      GST_ELEMENT_ERROR (filter, RESOURCE, NOT_FOUND,
-          ("%s", "Failed to download video frame"), (NULL));
-      ret = FALSE;
-    }
-  }
-
-  gst_video_frame_unmap (&gl_frame);
-unmap_out_error:
   gst_video_frame_unmap (&out_frame);
+unmap_out_error:
+  gst_video_frame_unmap (&gl_frame);
 inbuf_error:
-  gst_gl_upload_release_buffer (filter->upload);
-  gst_buffer_unref (upload_buffer);
 
   return ret;
 }
@@ -1316,73 +891,20 @@ static GstFlowReturn
 gst_gl_filter_transform (GstBaseTransform * bt, GstBuffer * inbuf,
     GstBuffer * outbuf)
 {
-  GstGLFilter *filter;
-  GstGLFilterClass *filter_class;
+  GstGLFilter *filter = GST_GL_FILTER (bt);
+  GstGLFilterClass *filter_class = GST_GL_FILTER_GET_CLASS (bt);
+  GstGLDisplay *display = GST_GL_BASE_FILTER (bt)->display;
+  GstGLContext *context = GST_GL_BASE_FILTER (bt)->context;
   GstGLSyncMeta *out_sync_meta, *in_sync_meta;
 
-  filter = GST_GL_FILTER (bt);
-  filter_class = GST_GL_FILTER_GET_CLASS (bt);
-
-  if (!filter->display)
+  if (!display)
     return GST_FLOW_NOT_NEGOTIATED;
-
-  if (!filter->upload) {
-    GstCaps *in_caps =
-        gst_pad_get_current_caps (GST_BASE_TRANSFORM_SINK_PAD (bt));
-    GstCaps *uploaded_caps;
-    GstCapsFeatures *out_features;
-    GstVideoInfo out_info;
-
-    gst_video_info_set_format (&out_info,
-        GST_VIDEO_FORMAT_RGBA,
-        GST_VIDEO_INFO_WIDTH (&filter->in_info),
-        GST_VIDEO_INFO_HEIGHT (&filter->in_info));
-    out_features =
-        gst_caps_features_from_string (GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
-
-    uploaded_caps = gst_caps_copy (in_caps);
-    gst_caps_set_features (uploaded_caps, 0, out_features);
-
-    filter->upload = gst_gl_upload_new (filter->context);
-    if (!gst_gl_upload_set_caps (filter->upload, in_caps, uploaded_caps)) {
-      gst_caps_unref (in_caps);
-      return GST_FLOW_ERROR;
-    }
-
-    gst_caps_unref (in_caps);
-
-    if (!filter->in_convert) {
-      GstCapsFeatures *converted_features;
-      GstVideoInfo converted_info;
-
-      gst_video_info_set_format (&converted_info,
-          GST_VIDEO_FORMAT_RGBA,
-          GST_VIDEO_INFO_WIDTH (&filter->in_info),
-          GST_VIDEO_INFO_HEIGHT (&filter->in_info));
-      converted_features =
-          gst_caps_features_from_string (GST_CAPS_FEATURE_MEMORY_GL_MEMORY);
-
-      if (filter->in_converted_caps)
-        gst_caps_unref (filter->in_converted_caps);
-      filter->in_converted_caps = gst_video_info_to_caps (&converted_info);
-      gst_caps_set_features (filter->in_converted_caps, 0, converted_features);
-
-      filter->in_convert = gst_gl_color_convert_new (filter->context);
-      if (!gst_gl_color_convert_set_caps (filter->in_convert, uploaded_caps,
-              filter->in_converted_caps)) {
-        gst_caps_unref (uploaded_caps);
-        return GST_FLOW_ERROR;
-      }
-    }
-
-    gst_caps_unref (uploaded_caps);
-  }
 
   g_assert (filter_class->filter || filter_class->filter_texture);
 
   in_sync_meta = gst_buffer_get_gl_sync_meta (inbuf);
   if (in_sync_meta)
-    gst_gl_sync_meta_wait (in_sync_meta);
+    gst_gl_sync_meta_wait (in_sync_meta, context);
 
   if (filter_class->filter)
     filter_class->filter (filter, inbuf, outbuf);
@@ -1391,7 +913,7 @@ gst_gl_filter_transform (GstBaseTransform * bt, GstBuffer * inbuf,
 
   out_sync_meta = gst_buffer_get_gl_sync_meta (outbuf);
   if (out_sync_meta)
-    gst_gl_sync_meta_set_sync_point (out_sync_meta, filter->context);
+    gst_gl_sync_meta_set_sync_point (out_sync_meta, context);
 
   return GST_FLOW_OK;
 }
@@ -1431,6 +953,7 @@ void
 gst_gl_filter_render_to_target (GstGLFilter * filter, gboolean resize,
     GLuint input, GLuint target, GLCB func, gpointer data)
 {
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
   guint in_width, in_height, out_width, out_height;
   struct glcb2 cb;
 
@@ -1453,7 +976,7 @@ gst_gl_filter_render_to_target (GstGLFilter * filter, gboolean resize,
   cb.width = in_width;
   cb.height = in_height;
 
-  gst_gl_context_use_fbo_v2 (filter->context, out_width, out_height,
+  gst_gl_context_use_fbo_v2 (context, out_width, out_height,
       filter->fbo, filter->depthbuffer, target, _glcb2, &cb);
 }
 
@@ -1461,10 +984,11 @@ static void
 _draw_with_shader_cb (gint width, gint height, guint texture, gpointer stuff)
 {
   GstGLFilter *filter = GST_GL_FILTER (stuff);
-  GstGLFuncs *gl = filter->context->gl_vtable;
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
+  GstGLFuncs *gl = context->gl_vtable;
 
 #if GST_GL_HAVE_OPENGL
-  if (gst_gl_context_get_gl_api (filter->context) & GST_GL_API_OPENGL) {
+  if (gst_gl_context_get_gl_api (context) & GST_GL_API_OPENGL) {
     gl->MatrixMode (GL_PROJECTION);
     gl->LoadIdentity ();
   }
@@ -1538,7 +1062,8 @@ static const GLfloat vertices[] = {
 static void
 _bind_buffer (GstGLFilter * filter)
 {
-  const GstGLFuncs *gl = filter->context->gl_vtable;
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
+  const GstGLFuncs *gl = context->gl_vtable;
 
   gl->BindBuffer (GL_ARRAY_BUFFER, filter->vertex_buffer);
 
@@ -1559,7 +1084,8 @@ _bind_buffer (GstGLFilter * filter)
 static void
 _unbind_buffer (GstGLFilter * filter)
 {
-  const GstGLFuncs *gl = filter->context->gl_vtable;
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
+  const GstGLFuncs *gl = context->gl_vtable;
 
   gl->BindBuffer (GL_ARRAY_BUFFER, 0);
 
@@ -1580,7 +1106,7 @@ void
 gst_gl_filter_draw_texture (GstGLFilter * filter, GLuint texture,
     guint width, guint height)
 {
-  GstGLContext *context = filter->context;
+  GstGLContext *context = GST_GL_BASE_FILTER (filter)->context;
   GstGLFuncs *gl = context->gl_vtable;
 
   GST_DEBUG ("drawing texture:%u dimensions:%ux%u", texture, width, height);

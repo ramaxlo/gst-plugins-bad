@@ -69,9 +69,8 @@ struct _GstAggregatorPad
 {
   GstPad                       parent;
 
-  GstBuffer                 *  buffer;
-  GstSegment                   segment;
-  gboolean                     eos;
+  /* Protected by the OBJECT_LOCK */
+  GstSegment segment;
 
   /* < Private > */
   GstAggregatorPadPrivate   *  priv;
@@ -105,6 +104,8 @@ GType gst_aggregator_pad_get_type           (void);
 
 GstBuffer * gst_aggregator_pad_steal_buffer (GstAggregatorPad *  pad);
 GstBuffer * gst_aggregator_pad_get_buffer   (GstAggregatorPad *  pad);
+gboolean    gst_aggregator_pad_drop_buffer  (GstAggregatorPad *  pad);
+gboolean    gst_aggregator_pad_is_eos       (GstAggregatorPad *  pad);
 
 /*********************
  * GstAggregator API *
@@ -118,7 +119,7 @@ GstBuffer * gst_aggregator_pad_get_buffer   (GstAggregatorPad *  pad);
 #define GST_IS_AGGREGATOR(obj)         (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_AGGREGATOR))
 #define GST_IS_AGGREGATOR_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_AGGREGATOR))
 
-#define GST_FLOW_CUSTOM_SUCCESS        GST_FLOW_NOT_HANDLED
+#define GST_FLOW_NOT_HANDLED           GST_FLOW_CUSTOM_SUCCESS
 
 /**
  * GstAggregator:
@@ -133,6 +134,7 @@ struct _GstAggregator
 
   GstPad                *  srcpad;
 
+  /* Only access with the object lock held */
   GstSegment               segment;
 
   /*< private >*/
@@ -269,10 +271,7 @@ gboolean gst_aggregator_iterate_sinkpads           (GstAggregator               
                                                     GstAggregatorPadForeachFunc      func,
                                                     gpointer                         user_data);
 
-void     gst_aggregator_get_latency                (GstAggregator                 *  self,
-                                                    gboolean                      *  live,
-                                                    GstClockTime                  *  min,
-                                                    GstClockTime                  *  max);
+GstClockTime  gst_aggregator_get_latency           (GstAggregator                 *  self);
 
 G_END_DECLS
 

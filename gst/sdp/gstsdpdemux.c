@@ -20,7 +20,7 @@
  * SECTION:element-sdpdemux
  *
  * sdpdemux currently understands SDP as the input format of the session description.
- * For each stream listed in the SDP a new stream_%u pad will be created
+ * For each stream listed in the SDP a new stream_\%u pad will be created
  * with caps derived from the SDP media description. This is a caps of mime type
  * "application/x-rtp" that can be connected to any available RTP depayloader
  * element. 
@@ -84,8 +84,7 @@ enum
   PROP_DEBUG,
   PROP_TIMEOUT,
   PROP_LATENCY,
-  PROP_REDIRECT,
-  PROP_LAST
+  PROP_REDIRECT
 };
 
 static void gst_sdp_demux_finalize (GObject * object);

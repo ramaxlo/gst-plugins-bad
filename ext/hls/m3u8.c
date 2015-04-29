@@ -851,7 +851,16 @@ gst_m3u8_client_update (GstM3U8Client * self, gchar * data)
 
   if (m3u8->files && self->sequence == -1) {
     self->current_file = g_list_first (m3u8->files);
-    self->sequence = GST_M3U8_MEDIA_FILE (self->current_file->data)->sequence;
+    if (GST_M3U8_CLIENT_IS_LIVE (self)) {
+      /* for live streams, start GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE from
+         the end of the playlist. See section 6.3.3 of HLS draft */
+      gint pos =
+          g_list_length (m3u8->files) - GST_M3U8_LIVE_MIN_FRAGMENT_DISTANCE;
+      self->sequence =
+          GST_M3U8_MEDIA_FILE (g_list_nth_data (m3u8->files,
+              pos >= 0 ? pos : 0))->sequence;
+    } else
+      self->sequence = GST_M3U8_MEDIA_FILE (self->current_file->data)->sequence;
     self->sequence_position = 0;
     GST_DEBUG ("Setting first sequence at %u", (guint) self->sequence);
   }
@@ -916,15 +925,16 @@ gst_m3u8_client_update_variant_playlist (GstM3U8Client * self, gchar * data,
     }
 
     if (unmatched_lists != NULL) {
-      g_list_free (unmatched_lists);
+      GST_WARNING ("Unable to match all playlists");
 
-      /* We should attempt to handle the case where playlists are dropped/replaced,
-       * and possibly switch over to a comparable (not neccessarily identical)
-       * playlist.
-       */
-      GST_FIXME
-          ("Cannot update variant playlist, unable to match all playlists");
-      goto out;
+      for (list_entry = unmatched_lists; list_entry;
+          list_entry = list_entry->next) {
+        if (list_entry->data == self->current) {
+          GST_WARNING ("Unable to match current playlist");
+        }
+      }
+
+      g_list_free (unmatched_lists);
     }
 
     /* Switch out the variant playlist */

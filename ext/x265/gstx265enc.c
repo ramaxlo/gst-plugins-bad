@@ -65,9 +65,9 @@ static GString *x265enc_defaults;
 #define PROP_TUNE_DEFAULT                2      // SSIM
 
 #if G_BYTE_ORDER == G_LITTLE_ENDIAN
-#define FORMATS "I420, Y444"
+#define FORMATS "I420, Y444, I420_10LE, Y444_10LE"
 #else
-#define FORMATS "I420, Y444"
+#define FORMATS "I420, Y444, I420_10BE, Y444_10BE"
 #endif
 
 #define GST_X265_ENC_LOG_LEVEL_TYPE (gst_x265_enc_log_level_get_type())
@@ -239,15 +239,40 @@ gst_x265_enc_add_x265_chroma_format (GstStructure * s,
 {
   GValue fmt = G_VALUE_INIT;
 
-  GST_INFO ("This x265 build supports 8-bit depth");
-  if (x265_chroma_format_local == 0) {
-    set_value (&fmt, 2, "I420", "Y444");
-  } else if (x265_chroma_format_local == X265_CSP_I444) {
-    set_value (&fmt, 1, "Y444");
-  } else if (x265_chroma_format_local == X265_CSP_I420) {
-    set_value (&fmt, 1, "I420");
-  } else {
-    GST_ERROR ("Unsupported chroma format %d", x265_chroma_format_local);
+  if (x265_max_bit_depth >= 10) {
+    GST_INFO ("This x265 build supports %d-bit depth", x265_max_bit_depth);
+    if (x265_chroma_format_local == 0) {
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+      set_value (&fmt, 4, "I420", "Y444", "I420_10LE", "Y444_10LE");
+#else
+      set_value (&fmt, 4, "I420", "Y444", "I420_10BE", "Y444_10BE");
+#endif
+    } else if (x265_chroma_format_local == X265_CSP_I444) {
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+      set_value (&fmt, 2, "Y444", "Y444_10LE");
+#else
+      set_value (&fmt, 2, "Y444", "Y444_10BE");
+#endif
+    } else if (x265_chroma_format_local == X265_CSP_I420) {
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+      set_value (&fmt, 2, "I420", "I420_10LE");
+#else
+      set_value (&fmt, 2, "I420", "I420_10BE");
+#endif
+    } else {
+      GST_ERROR ("Unsupported chroma format %d", x265_chroma_format_local);
+    }
+  } else if (x265_max_bit_depth == 8) {
+    GST_INFO ("This x265 build supports 8-bit depth");
+    if (x265_chroma_format_local == 0) {
+      set_value (&fmt, 2, "I420", "Y444");
+    } else if (x265_chroma_format_local == X265_CSP_I444) {
+      set_value (&fmt, 1, "Y444");
+    } else if (x265_chroma_format_local == X265_CSP_I420) {
+      set_value (&fmt, 1, "I420");
+    } else {
+      GST_ERROR ("Unsupported chroma format %d", x265_chroma_format_local);
+    }
   }
 
   if (G_VALUE_TYPE (&fmt) != G_TYPE_INVALID)
@@ -501,10 +526,14 @@ gst_x265_enc_gst_to_x265_video_format (GstVideoFormat format, gint * nplanes)
   switch (format) {
     case GST_VIDEO_FORMAT_I420:
     case GST_VIDEO_FORMAT_YV12:
+    case GST_VIDEO_FORMAT_I420_10LE:
+    case GST_VIDEO_FORMAT_I420_10BE:
       if (nplanes)
         *nplanes = 3;
       return X265_CSP_I420;
     case GST_VIDEO_FORMAT_Y444:
+    case GST_VIDEO_FORMAT_Y444_10LE:
+    case GST_VIDEO_FORMAT_Y444_10BE:
       if (nplanes)
         *nplanes = 3;
       return X265_CSP_I444;
@@ -824,27 +853,32 @@ static void
 gst_x265_enc_set_latency (GstX265Enc * encoder)
 {
   GstVideoInfo *info = &encoder->input_state->info;
+  gint max_delayed_frames;
+  GstClockTime latency;
+
+  /* FIXME get a real value from the encoder, this is currently not exposed */
+  if (encoder->tune > 0 && encoder->tune <= G_N_ELEMENTS (x265_tune_names) &&
+      strcmp (x265_tune_names[encoder->tune + 1], "zerolatency") == 0)
+    max_delayed_frames = 0;
+  else
+    max_delayed_frames = 5;
 
   if (info->fps_n) {
-    GstClockTime latency;
-    gint max_delayed_frames;
-
-    // FIXME get a real value from the encoder, this is currently not exposed
-    max_delayed_frames = 5;
     latency = gst_util_uint64_scale_ceil (GST_SECOND * info->fps_d,
         max_delayed_frames, info->fps_n);
-
-    GST_INFO_OBJECT (encoder,
-        "Updating latency to %" GST_TIME_FORMAT " (%d frames)",
-        GST_TIME_ARGS (latency), max_delayed_frames);
-
-    gst_video_encoder_set_latency (GST_VIDEO_ENCODER (encoder), latency,
-        latency);
   } else {
-    /* We can't do live as we don't know our latency */
-    gst_video_encoder_set_latency (GST_VIDEO_ENCODER (encoder),
-        0, GST_CLOCK_TIME_NONE);
+    /* FIXME: Assume 25fps. This is better than reporting no latency at
+     * all and then later failing in live pipelines
+     */
+    latency = gst_util_uint64_scale_ceil (GST_SECOND * 1,
+        max_delayed_frames, 25);
   }
+
+  GST_INFO_OBJECT (encoder,
+      "Updating latency to %" GST_TIME_FORMAT " (%d frames)",
+      GST_TIME_ARGS (latency), max_delayed_frames);
+
+  gst_video_encoder_set_latency (GST_VIDEO_ENCODER (encoder), latency, latency);
 }
 
 static gboolean
@@ -947,7 +981,7 @@ gst_x265_enc_handle_frame (GstVideoEncoder * video_enc,
   pic_in.sliceType = X265_TYPE_AUTO;
   pic_in.pts = frame->pts;
   pic_in.dts = frame->dts;
-  pic_in.bitDepth = 8;
+  pic_in.bitDepth = info->finfo->depth[0];
   pic_in.userData = GINT_TO_POINTER (frame->system_frame_number);
 
   ret = gst_x265_enc_encode_frame (encoder, &pic_in, frame, &i_nal, TRUE);

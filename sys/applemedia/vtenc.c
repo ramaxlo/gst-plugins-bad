@@ -1014,6 +1014,11 @@ gst_vtenc_update_latency (GstVTEnc * self)
 
   status = VTSessionCopyProperty (self->session,
       kVTCompressionPropertyKey_NumberOfPendingFrames, NULL, &value);
+  if (status != noErr || !value) {
+    GST_INFO_OBJECT (self, "failed to get NumberOfPendingFrames: %d", status);
+    return;
+  }
+
   CFNumberGetValue (value, kCFNumberSInt32Type, &frames);
   if (self->latency_frames == -1 || self->latency_frames != frames) {
     self->latency_frames = frames;
@@ -1098,7 +1103,8 @@ gst_vtenc_encode_frame (GstVTEnc * self, GstVideoCodecFrame * frame)
       goto cv_error;
     }
 
-    outbuf = gst_core_video_buffer_new ((CVBufferRef) pbuf, &self->video_info);
+    outbuf =
+        gst_core_video_buffer_new ((CVBufferRef) pbuf, &self->video_info, TRUE);
     if (!gst_video_frame_map (&outframe, &self->video_info, outbuf,
             GST_MAP_WRITE)) {
       gst_video_frame_unmap (&inframe);
@@ -1271,7 +1277,7 @@ gst_vtenc_enqueue_buffer (void *outputCallbackRefCon,
 
   /* We are dealing with block buffers here, so we don't need
    * to enable the use of the video meta API on the core media buffer */
-  frame->output_buffer = gst_core_media_buffer_new (sampleBuffer, FALSE);
+  frame->output_buffer = gst_core_media_buffer_new (sampleBuffer, FALSE, TRUE);
 
   g_async_queue_push (self->cur_outframes, frame);
 

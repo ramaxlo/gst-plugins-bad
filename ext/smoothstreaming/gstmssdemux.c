@@ -77,7 +77,6 @@
 
 GST_DEBUG_CATEGORY (mssdemux_debug);
 
-#define DEFAULT_CONNECTION_SPEED 0
 #define DEFAULT_MAX_QUEUE_SIZE_BUFFERS 0
 #define DEFAULT_BITRATE_LIMIT 0.8
 
@@ -85,9 +84,7 @@ enum
 {
   PROP_0,
 
-  PROP_CONNECTION_SPEED,
   PROP_MAX_QUEUE_SIZE_BUFFERS,
-  PROP_BITRATE_LIMIT,
   PROP_LAST
 };
 
@@ -138,7 +135,8 @@ static gboolean gst_mss_demux_seek (GstAdaptiveDemux * demux, GstEvent * seek);
 static gint64
 gst_mss_demux_get_manifest_update_interval (GstAdaptiveDemux * demux);
 static GstFlowReturn
-gst_mss_demux_update_manifest (GstAdaptiveDemux * demux, GstBuffer * buffer);
+gst_mss_demux_update_manifest_data (GstAdaptiveDemux * demux,
+    GstBuffer * buffer);
 
 static void
 gst_mss_demux_class_init (GstMssDemuxClass * klass)
@@ -166,12 +164,6 @@ gst_mss_demux_class_init (GstMssDemuxClass * klass)
   gobject_class->set_property = gst_mss_demux_set_property;
   gobject_class->get_property = gst_mss_demux_get_property;
 
-  g_object_class_install_property (gobject_class, PROP_CONNECTION_SPEED,
-      g_param_spec_uint ("connection-speed", "Connection Speed",
-          "Network connection speed in kbps (0 = unknown)",
-          0, G_MAXUINT / 1000, DEFAULT_CONNECTION_SPEED,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
 #ifndef GST_REMOVE_DEPRECATED
   g_object_class_install_property (gobject_class, PROP_MAX_QUEUE_SIZE_BUFFERS,
       g_param_spec_uint ("max-queue-size-buffers", "Max queue size in buffers",
@@ -180,13 +172,6 @@ gst_mss_demux_class_init (GstMssDemuxClass * klass)
           DEFAULT_MAX_QUEUE_SIZE_BUFFERS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_DEPRECATED));
 #endif
-
-  g_object_class_install_property (gobject_class, PROP_BITRATE_LIMIT,
-      g_param_spec_float ("bitrate-limit",
-          "Bitrate limit in %",
-          "Limit of the available bitrate to use when switching to alternates.",
-          0, 1, DEFAULT_BITRATE_LIMIT,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstadaptivedemux_class->process_manifest = gst_mss_demux_process_manifest;
   gstadaptivedemux_class->is_live = gst_mss_demux_is_live;
@@ -204,7 +189,8 @@ gst_mss_demux_class_init (GstMssDemuxClass * klass)
       gst_mss_demux_stream_select_bitrate;
   gstadaptivedemux_class->stream_update_fragment_info =
       gst_mss_demux_stream_update_fragment_info;
-  gstadaptivedemux_class->update_manifest = gst_mss_demux_update_manifest;
+  gstadaptivedemux_class->update_manifest_data =
+      gst_mss_demux_update_manifest_data;
 
   GST_DEBUG_CATEGORY_INIT (mssdemux_debug, "mssdemux", 0, "mssdemux plugin");
 }
@@ -213,7 +199,6 @@ static void
 gst_mss_demux_init (GstMssDemux * mssdemux)
 {
   mssdemux->data_queue_max_size = DEFAULT_MAX_QUEUE_SIZE_BUFFERS;
-  mssdemux->bitrate_limit = DEFAULT_BITRATE_LIMIT;
 
   gst_adaptive_demux_set_stream_struct_size (GST_ADAPTIVE_DEMUX_CAST (mssdemux),
       sizeof (GstMssDemuxStream));
@@ -250,19 +235,8 @@ gst_mss_demux_set_property (GObject * object, guint prop_id,
   GstMssDemux *mssdemux = GST_MSS_DEMUX (object);
 
   switch (prop_id) {
-    case PROP_CONNECTION_SPEED:
-      GST_OBJECT_LOCK (mssdemux);
-      mssdemux->connection_speed = g_value_get_uint (value) * 1000;
-      mssdemux->update_bitrates = TRUE;
-      GST_DEBUG_OBJECT (mssdemux, "Connection speed set to %" G_GUINT64_FORMAT,
-          mssdemux->connection_speed);
-      GST_OBJECT_UNLOCK (mssdemux);
-      break;
     case PROP_MAX_QUEUE_SIZE_BUFFERS:
       mssdemux->data_queue_max_size = g_value_get_uint (value);
-      break;
-    case PROP_BITRATE_LIMIT:
-      mssdemux->bitrate_limit = g_value_get_float (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -277,14 +251,8 @@ gst_mss_demux_get_property (GObject * object, guint prop_id, GValue * value,
   GstMssDemux *mssdemux = GST_MSS_DEMUX (object);
 
   switch (prop_id) {
-    case PROP_CONNECTION_SPEED:
-      g_value_set_uint (value, mssdemux->connection_speed / 1000);
-      break;
     case PROP_MAX_QUEUE_SIZE_BUFFERS:
       g_value_set_uint (value, mssdemux->data_queue_max_size);
-      break;
-    case PROP_BITRATE_LIMIT:
-      g_value_set_float (value, mssdemux->bitrate_limit);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -320,9 +288,7 @@ gst_mss_demux_stream_update_fragment_info (GstAdaptiveDemuxStream * stream)
   GstFlowReturn ret;
   gchar *path = NULL;
 
-  g_free (stream->fragment.uri);
-  stream->fragment.uri = NULL;
-
+  gst_adaptive_demux_stream_fragment_clear (&stream->fragment);
   ret = gst_mss_stream_get_fragment_url (mssstream->manifest_stream, &path);
 
   if (ret == GST_FLOW_OK) {
@@ -416,11 +382,9 @@ gst_mss_demux_setup_streams (GstAdaptiveDemux * demux)
     return FALSE;
   }
 
-  GST_INFO_OBJECT (mssdemux, "Changing max bitrate to %" G_GUINT64_FORMAT,
-      mssdemux->connection_speed);
-  gst_mss_manifest_change_bitrate (mssdemux->manifest,
-      mssdemux->connection_speed);
-  mssdemux->update_bitrates = FALSE;
+  GST_INFO_OBJECT (mssdemux, "Changing max bitrate to %u",
+      demux->connection_speed);
+  gst_mss_manifest_change_bitrate (mssdemux->manifest, demux->connection_speed);
 
   for (iter = streams; iter; iter = g_slist_next (iter)) {
     GstPad *srcpad = NULL;
@@ -503,14 +467,8 @@ static gboolean
 gst_mss_demux_stream_select_bitrate (GstAdaptiveDemuxStream * stream,
     guint64 bitrate)
 {
-  GstMssDemux *mssdemux = GST_MSS_DEMUX_CAST (stream->demux);
   GstMssDemuxStream *mssstream = (GstMssDemuxStream *) stream;
   gboolean ret = FALSE;
-
-  bitrate *= mssdemux->bitrate_limit;
-  if (mssdemux->connection_speed) {
-    bitrate = MIN (mssdemux->connection_speed, bitrate);
-  }
 
   GST_DEBUG_OBJECT (stream->pad,
       "Using stream download bitrate %" G_GUINT64_FORMAT, bitrate);
@@ -590,7 +548,8 @@ gst_mss_demux_get_manifest_update_interval (GstAdaptiveDemux * demux)
 }
 
 static GstFlowReturn
-gst_mss_demux_update_manifest (GstAdaptiveDemux * demux, GstBuffer * buffer)
+gst_mss_demux_update_manifest_data (GstAdaptiveDemux * demux,
+    GstBuffer * buffer)
 {
   GstMssDemux *mssdemux = GST_MSS_DEMUX_CAST (demux);
 

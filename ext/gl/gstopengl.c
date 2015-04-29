@@ -44,6 +44,13 @@
 #endif
 
 #include "gstglimagesink.h"
+#include "gstgluploadelement.h"
+#include "gstgldownloadelement.h"
+#include "gstglcolorconvertelement.h"
+#include "gstglfilterbin.h"
+#include "gstglsinkbin.h"
+#include "gstglsrcbin.h"
+#include "gstglmixerbin.h"
 
 #include "gstglfiltercube.h"
 #include "gstgleffects.h"
@@ -62,11 +69,8 @@
 
 #if GST_GL_HAVE_OPENGL
 #include "gstgltestsrc.h"
-#include "gstglfilterlaplacian.h"
 #include "gstglfilterglass.h"
-#include "gstglfilterblur.h"
 /* #include "gstglfilterreflectedscreen.h" */
-#include "gstglfiltersobel.h"
 #include "gstgldeinterlace.h"
 #include "gstglmosaic.h"
 #if HAVE_PNG
@@ -74,6 +78,11 @@
 /* #include "gstglbumper.h" */
 #endif /* HAVE_PNG */
 #endif /* GST_GL_HAVE_OPENGL */
+
+#if GST_GL_HAVE_WINDOW_COCOA
+/* avoid including Cocoa/CoreFoundation from a C file... */
+extern GType gst_ca_opengl_layer_sink_bin_get_type (void);
+#endif
 
 #ifdef USE_EGL_RPI
 #include <bcm_host.h>
@@ -103,7 +112,42 @@ plugin_init (GstPlugin * plugin)
 #endif
 
   if (!gst_element_register (plugin, "glimagesink",
-          GST_RANK_SECONDARY, GST_TYPE_GLIMAGE_SINK)) {
+          GST_RANK_SECONDARY, gst_gl_image_sink_bin_get_type ())) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glupload",
+          GST_RANK_SECONDARY, GST_TYPE_GL_UPLOAD_ELEMENT)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "gldownload",
+          GST_RANK_SECONDARY, GST_TYPE_GL_DOWNLOAD_ELEMENT)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glcolorconvert",
+          GST_RANK_SECONDARY, GST_TYPE_GL_COLOR_CONVERT_ELEMENT)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glfilterbin",
+          GST_RANK_NONE, GST_TYPE_GL_FILTER_BIN)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glsinkbin",
+          GST_RANK_NONE, GST_TYPE_GL_SINK_BIN)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glsrcbin",
+          GST_RANK_NONE, GST_TYPE_GL_SRC_BIN)) {
+    return FALSE;
+  }
+
+  if (!gst_element_register (plugin, "glmixerbin",
+          GST_RANK_NONE, GST_TYPE_GL_MIXER_BIN)) {
     return FALSE;
   }
 
@@ -117,10 +161,10 @@ plugin_init (GstPlugin * plugin)
     return FALSE;
   }
 #endif
-  if (!gst_element_register (plugin, "gleffects",
-          GST_RANK_NONE, gst_gl_effects_get_type ())) {
+
+  if (!gst_gl_effects_register_filters (plugin, GST_RANK_NONE)) {
     return FALSE;
-  }
+  };
 
   if (!gst_element_register (plugin, "glcolorscale",
           GST_RANK_NONE, GST_TYPE_GL_COLORSCALE)) {
@@ -128,7 +172,7 @@ plugin_init (GstPlugin * plugin)
   }
 
   if (!gst_element_register (plugin, "glvideomixer",
-          GST_RANK_NONE, GST_TYPE_GL_VIDEO_MIXER)) {
+          GST_RANK_NONE, gst_gl_video_mixer_bin_get_type ())) {
     return FALSE;
   }
 
@@ -152,21 +196,6 @@ plugin_init (GstPlugin * plugin)
 #if GST_GL_HAVE_OPENGL
   if (!gst_element_register (plugin, "gltestsrc",
           GST_RANK_NONE, GST_TYPE_GL_TEST_SRC)) {
-    return FALSE;
-  }
-
-  if (!gst_element_register (plugin, "glfilterblur",
-          GST_RANK_NONE, gst_gl_filterblur_get_type ())) {
-    return FALSE;
-  }
-
-  if (!gst_element_register (plugin, "glfiltersobel",
-          GST_RANK_NONE, gst_gl_filtersobel_get_type ())) {
-    return FALSE;
-  }
-
-  if (!gst_element_register (plugin, "glfilterlaplacian",
-          GST_RANK_NONE, GST_TYPE_GL_FILTER_LAPLACIAN)) {
     return FALSE;
   }
 
@@ -202,6 +231,12 @@ plugin_init (GstPlugin * plugin)
 #endif
 #endif /* HAVE_PNG */
 #endif /* GST_GL_HAVE_OPENGL */
+#if GST_GL_HAVE_WINDOW_COCOA
+  if (!gst_element_register (plugin, "caopengllayersink",
+          GST_RANK_NONE, gst_ca_opengl_layer_sink_bin_get_type ())) {
+    return FALSE;
+  }
+#endif
 
   return TRUE;
 }
