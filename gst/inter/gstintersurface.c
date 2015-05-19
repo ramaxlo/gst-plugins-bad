@@ -73,6 +73,7 @@ gst_deferred_client_reset (GstDeferredClient * client)
 
   client->started = FALSE;
 
+  g_cond_signal (&client->buffer_cond);
   g_mutex_unlock (&client->mutex);
 }
 
@@ -299,7 +300,7 @@ gst_deferred_client_push_buffer (GstDeferredClient * client, GstBuffer * buf)
 GstBuffer *
 gst_deferred_client_get_buffer (GstDeferredClient * client)
 {
-  GstBuffer *buf;
+  GstBuffer *buf = NULL;
 
   g_mutex_lock (&client->mutex);
 
@@ -311,6 +312,8 @@ gst_deferred_client_get_buffer (GstDeferredClient * client)
   if (g_queue_is_empty (&client->buffers)) {
     GST_LOG ("Waiting for a buffer");
     g_cond_wait (&client->buffer_cond, &client->mutex);
+    if (g_queue_is_empty (&client->buffers))
+      goto done;
   }
 
   buf = GST_BUFFER_CAST (g_queue_pop_head (&client->buffers));

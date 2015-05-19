@@ -207,6 +207,10 @@ gst_inter_app_src_create (GstBaseSrc * src, guint64 offset, guint size,
       &changed, TRUE);
 
   buffer = gst_deferred_client_get_buffer (&interappsrc->surface->app_client);
+  if (!buffer && interappsrc->surface->app_client.started == FALSE) {
+    GST_DEBUG_OBJECT (interappsrc, "End of stream");
+    return GST_FLOW_EOS;
+  }
 
   if (changed) {
     GST_DEBUG_OBJECT (interappsrc, "Got caps: %" GST_PTR_FORMAT, caps);
