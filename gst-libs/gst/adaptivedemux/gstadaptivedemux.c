@@ -1130,8 +1130,10 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
       gint64 start = 0;
 
       GST_MANIFEST_LOCK (demux);
-      if (demux->priv->have_manifest) {
+      if (!demux->priv->have_manifest) {
         GST_MANIFEST_UNLOCK (demux);
+        GST_INFO_OBJECT (demux,
+            "Don't have manifest yet, can't answer seeking query");
         return FALSE;           /* can't answer without manifest */
       }
 
@@ -1892,7 +1894,6 @@ gst_adaptive_demux_stream_download_fragment (GstAdaptiveDemuxStream * stream)
     GST_DEBUG_OBJECT (stream->pad, "Fragment download result: %d %s",
         stream->last_ret, gst_flow_get_name (stream->last_ret));
     if (ret != GST_FLOW_OK) {
-      GST_INFO_OBJECT (demux, "No fragment downloaded");
       /* TODO check if we are truly stoping */
       if (ret != GST_FLOW_ERROR && gst_adaptive_demux_is_live (demux)) {
         /* looks like there is no way of knowing when a live stream has ended
@@ -1972,37 +1973,28 @@ gst_adaptive_demux_stream_download_loop (GstAdaptiveDemuxStream * stream)
     GST_DEBUG_OBJECT (stream->pad,
         "Activating stream due to reconfigure event");
 
-    cur = stream->segment.position;
+    cur = ts = stream->segment.position;
 
     if (gst_pad_peer_query_position (stream->pad, GST_FORMAT_TIME, &pos)) {
       ts = (GstClockTime) pos;
       GST_DEBUG_OBJECT (demux, "Downstream position: %"
           GST_TIME_FORMAT, GST_TIME_ARGS (ts));
     } else {
-      gboolean have_pos = FALSE;
-
       /* query other pads as some faulty element in the pad's branch might
        * reject position queries. This should be better than using the
        * demux segment position that can be much ahead */
       for (GList * iter = demux->streams; iter != NULL;
           iter = g_list_next (iter)) {
-        GstAdaptiveDemuxStream *cur_stream = iter->data;
+        GstAdaptiveDemuxStream *cur_stream =
+            (GstAdaptiveDemuxStream *) iter->data;
 
-        have_pos =
-            gst_pad_peer_query_position (cur_stream->pad, GST_FORMAT_TIME,
-            &pos);
-        if (have_pos) {
+        if (gst_pad_peer_query_position (cur_stream->pad, GST_FORMAT_TIME,
+                &pos)) {
           ts = (GstClockTime) pos;
           GST_DEBUG_OBJECT (stream->pad, "Downstream position: %"
               GST_TIME_FORMAT, GST_TIME_ARGS (ts));
           break;
         }
-      }
-
-      if (!have_pos) {
-        ts = stream->segment.position;
-        GST_DEBUG_OBJECT (stream->pad, "Downstream position query failed, "
-            "failling back to looking at other pads");
       }
     }
 

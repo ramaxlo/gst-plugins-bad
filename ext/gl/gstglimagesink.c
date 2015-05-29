@@ -113,6 +113,7 @@ GST_DEBUG_CATEGORY (gst_debug_glimage_sink);
 #define DEFAULT_MAX_BITRATE         0
 #define DEFAULT_HANDLE_EVENTS       TRUE
 #define DEFAULT_FORCE_ASPECT_RATIO  TRUE
+#define DEFAULT_IGNORE_ALPHA        TRUE
 
 typedef GstGLSinkBin GstGLImageSinkBin;
 typedef GstGLSinkBinClass GstGLImageSinkBinClass;
@@ -221,7 +222,7 @@ gst_gl_image_sink_bin_class_init (GstGLImageSinkBinClass * klass)
   g_object_class_install_property (gobject_class, PROP_BIN_HANDLE_EVENTS,
       g_param_spec_boolean ("ignore-alpha", "Ignore Alpha",
           "When enabled, alpha will be ignored and converted to black",
-          DEFAULT_HANDLE_EVENTS, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          DEFAULT_IGNORE_ALPHA, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_BIN_CONTEXT,
       g_param_spec_object ("context", "OpenGL context", "Get OpenGL context",
           GST_GL_TYPE_CONTEXT, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
@@ -463,10 +464,6 @@ gst_glimage_sink_class_init (GstGLImageSinkClass * klass)
   gobject_class->set_property = gst_glimage_sink_set_property;
   gobject_class->get_property = gst_glimage_sink_get_property;
 
-  g_object_class_install_property (gobject_class, ARG_DISPLAY,
-      g_param_spec_string ("display", "Display", "Display name",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
   g_object_class_install_property (gobject_class, PROP_FORCE_ASPECT_RATIO,
       g_param_spec_boolean ("force-aspect-ratio", "Force aspect ratio",
           "When enabled, scaling will respect original aspect ratio",
@@ -484,13 +481,13 @@ gst_glimage_sink_class_init (GstGLImageSinkClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_HANDLE_EVENTS,
       g_param_spec_boolean ("handle-events", "Handle XEvents",
-          "When enabled, XEvents will be selected and handled", TRUE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          "When enabled, XEvents will be selected and handled",
+          DEFAULT_HANDLE_EVENTS, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_IGNORE_ALPHA,
       g_param_spec_boolean ("ignore-alpha", "Ignore Alpha",
-          "When enabled, alpha will be ignored and converted to black", TRUE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          "When enabled, alpha will be ignored and converted to black",
+          DEFAULT_IGNORE_ALPHA, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_set_metadata (element_class, "OpenGL video sink",
       "Sink/Video", "A videosink based on OpenGL",
@@ -553,7 +550,6 @@ gst_glimage_sink_class_init (GstGLImageSinkClass * klass)
 static void
 gst_glimage_sink_init (GstGLImageSink * glimage_sink)
 {
-  glimage_sink->display_name = NULL;
   glimage_sink->window_id = 0;
   glimage_sink->new_window_id = 0;
   glimage_sink->display = NULL;
@@ -580,12 +576,6 @@ gst_glimage_sink_set_property (GObject * object, guint prop_id,
   glimage_sink = GST_GLIMAGE_SINK (object);
 
   switch (prop_id) {
-    case ARG_DISPLAY:
-    {
-      g_free (glimage_sink->display_name);
-      glimage_sink->display_name = g_strdup (g_value_get_string (value));
-      break;
-    }
     case PROP_FORCE_ASPECT_RATIO:
     {
       glimage_sink->keep_aspect_ratio = g_value_get_boolean (value);
@@ -621,8 +611,6 @@ gst_glimage_sink_finalize (GObject * object)
 
   g_mutex_clear (&glimage_sink->drawing_lock);
 
-  g_free (glimage_sink->display_name);
-
   GST_DEBUG ("finalized");
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -638,9 +626,6 @@ gst_glimage_sink_get_property (GObject * object, guint prop_id,
   glimage_sink = GST_GLIMAGE_SINK (object);
 
   switch (prop_id) {
-    case ARG_DISPLAY:
-      g_value_set_string (value, glimage_sink->display_name);
-      break;
     case PROP_FORCE_ASPECT_RATIO:
       g_value_set_boolean (value, glimage_sink->keep_aspect_ratio);
       break;
@@ -703,8 +688,10 @@ _ensure_gl_setup (GstGLImageSink * gl_sink)
           gl_sink->display);
 
       gl_sink->context = gst_gl_context_new (gl_sink->display);
-      if (!gl_sink->context)
+      if (!gl_sink->context) {
+        GST_OBJECT_UNLOCK (gl_sink->display);
         goto context_creation_error;
+      }
 
       window = gst_gl_context_get_window (gl_sink->context);
 
@@ -738,6 +725,7 @@ _ensure_gl_setup (GstGLImageSink * gl_sink)
         if (other_context)
           gst_object_unref (other_context);
         gst_object_unref (window);
+        GST_OBJECT_UNLOCK (gl_sink->display);
         goto context_error;
       }
 
@@ -797,10 +785,8 @@ gst_glimage_sink_query (GstBaseSink * bsink, GstQuery * query)
     {
       const gchar *context_type;
       GstContext *context, *old_context;
-      gboolean ret;
 
-      ret =
-          gst_gl_handle_context_query ((GstElement *) glimage_sink, query,
+      res = gst_gl_handle_context_query ((GstElement *) glimage_sink, query,
           &glimage_sink->display, &glimage_sink->other_context);
       if (glimage_sink->display)
         gst_gl_display_filter_gl_api (glimage_sink->display, SUPPORTED_GL_APIS);
@@ -823,12 +809,14 @@ gst_glimage_sink_query (GstBaseSink * bsink, GstQuery * query)
         gst_query_set_context (query, context);
         gst_context_unref (context);
 
-        ret = glimage_sink->context != NULL;
+        res = glimage_sink->context != NULL;
       }
-      GST_DEBUG_OBJECT (glimage_sink, "context query of type %s %i",
-          context_type, ret);
+      GST_LOG_OBJECT (glimage_sink, "context query of type %s %i", context_type,
+          res);
 
-      return ret;
+      if (res)
+        return res;
+      break;
     }
     case GST_QUERY_DRAIN:
     {
@@ -844,6 +832,7 @@ gst_glimage_sink_query (GstBaseSink * bsink, GstQuery * query)
         gst_buffer_unref (buf);
 
       gst_buffer_replace (&glimage_sink->next_buffer, NULL);
+      gst_buffer_replace (&glimage_sink->next_sync, NULL);
 
       res = GST_BASE_SINK_CLASS (parent_class)->query (bsink, query);
       break;
@@ -913,19 +902,29 @@ gst_glimage_sink_change_state (GstElement * element, GstStateChange transition)
        * to avoid drawing
        */
       GST_GLIMAGE_SINK_LOCK (glimage_sink);
+      if (glimage_sink->stored_sync)
+        gst_buffer_unref (glimage_sink->stored_sync);
+      glimage_sink->stored_sync = NULL;
+
       glimage_sink->redisplay_texture = 0;
       if (glimage_sink->stored_buffer) {
         gst_buffer_unref (glimage_sink->stored_buffer);
         glimage_sink->stored_buffer = NULL;
       }
-      GST_GLIMAGE_SINK_UNLOCK (glimage_sink);
       gst_buffer_replace (&glimage_sink->next_buffer, NULL);
+      gst_buffer_replace (&glimage_sink->next_sync, NULL);
+      GST_GLIMAGE_SINK_UNLOCK (glimage_sink);
 
       glimage_sink->window_id = 0;
       /* but do not reset glimage_sink->new_window_id */
 
       GST_VIDEO_SINK_WIDTH (glimage_sink) = 1;
       GST_VIDEO_SINK_HEIGHT (glimage_sink) = 1;
+      /* Clear cached caps */
+      if (glimage_sink->caps) {
+        gst_caps_unref (glimage_sink->caps);
+        glimage_sink->caps = NULL;
+      }
 
       /* we're losing the context, this pool is no use anymore */
       if (glimage_sink->pool) {
@@ -1003,7 +1002,7 @@ gst_glimage_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
   GstCaps *tmp = NULL;
   GstCaps *result = NULL;
 
-  tmp = gst_caps_from_string ("video/x-raw(memory:GLMemory),format=RGBA");
+  tmp = gst_pad_get_pad_template_caps (GST_BASE_SINK_PAD (bsink));
 
   if (filter) {
     result = gst_caps_intersect_full (filter, tmp, GST_CAPS_INTERSECT_FIRST);
@@ -1087,6 +1086,8 @@ gst_glimage_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
       GST_VIDEO_SINK_HEIGHT (glimage_sink));
 
   glimage_sink->info = vinfo;
+  glimage_sink->caps = gst_caps_ref (caps);
+
   if (!_ensure_gl_setup (glimage_sink))
     return FALSE;
 
@@ -1100,6 +1101,8 @@ gst_glimage_sink_prepare (GstBaseSink * bsink, GstBuffer * buf)
 {
   GstGLImageSink *glimage_sink;
   GstVideoFrame gl_frame;
+  GstBuffer *next_sync, *old_sync, *old_buffer;
+  GstGLSyncMeta *sync_meta;
 
   glimage_sink = GST_GLIMAGE_SINK (bsink);
 
@@ -1118,9 +1121,24 @@ gst_glimage_sink_prepare (GstBaseSink * bsink, GstBuffer * buf)
     goto upload_failed;
   }
 
+  next_sync = gst_buffer_new ();
+  sync_meta = gst_buffer_add_gl_sync_meta (glimage_sink->context, next_sync);
+  gst_gl_sync_meta_set_sync_point (sync_meta, glimage_sink->context);
+
+  GST_GLIMAGE_SINK_LOCK (glimage_sink);
   glimage_sink->next_tex = *(guint *) gl_frame.data[0];
 
-  gst_buffer_replace (&glimage_sink->next_buffer, buf);
+  old_buffer = glimage_sink->next_buffer;
+  glimage_sink->next_buffer = gst_buffer_ref (buf);
+
+  old_sync = glimage_sink->next_sync;
+  glimage_sink->next_sync = next_sync;
+  GST_GLIMAGE_SINK_UNLOCK (glimage_sink);
+
+  if (old_buffer)
+    gst_buffer_unref (old_buffer);
+  if (old_sync)
+    gst_buffer_unref (old_sync);
 
   gst_video_frame_unmap (&gl_frame);
 
@@ -1147,7 +1165,7 @@ static GstFlowReturn
 gst_glimage_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
 {
   GstGLImageSink *glimage_sink;
-  GstBuffer *stored_buffer;
+  GstBuffer *stored_buffer, *old_sync;
 
   GST_TRACE ("rendering buffer:%p", buf);
 
@@ -1164,6 +1182,10 @@ gst_glimage_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
   glimage_sink->redisplay_texture = glimage_sink->next_tex;
   stored_buffer = glimage_sink->stored_buffer;
   glimage_sink->stored_buffer = gst_buffer_ref (glimage_sink->next_buffer);
+
+  old_sync = glimage_sink->stored_sync;
+  glimage_sink->stored_sync = gst_buffer_ref (glimage_sink->next_sync);
+
   GST_GLIMAGE_SINK_UNLOCK (glimage_sink);
 
   /* Ask the underlying window to redraw its content */
@@ -1174,6 +1196,8 @@ gst_glimage_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
 
   if (stored_buffer)
     gst_buffer_unref (stored_buffer);
+  if (old_sync)
+    gst_buffer_unref (old_sync);
 
   if (g_atomic_int_get (&glimage_sink->to_quit) != 0) {
     GST_ELEMENT_ERROR (glimage_sink, RESOURCE, NOT_FOUND,
@@ -1338,6 +1362,8 @@ static const GLfloat vertices[] = {
     -1.0f, -1.0f, 0.0f, 0.0f, 1.0f,
      1.0f, -1.0f, 0.0f, 1.0f, 1.0f
 };
+
+static const GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
 /* *INDENT-ON* */
 
 static void
@@ -1345,9 +1371,8 @@ _bind_buffer (GstGLImageSink * gl_sink)
 {
   const GstGLFuncs *gl = gl_sink->context->gl_vtable;
 
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, gl_sink->vbo_indices);
   gl->BindBuffer (GL_ARRAY_BUFFER, gl_sink->vertex_buffer);
-  gl->BufferData (GL_ARRAY_BUFFER, 4 * 5 * sizeof (GLfloat), vertices,
-      GL_STATIC_DRAW);
 
   /* Load the vertex position */
   gl->VertexAttribPointer (gl_sink->attr_position, 3, GL_FLOAT, GL_FALSE,
@@ -1366,6 +1391,7 @@ _unbind_buffer (GstGLImageSink * gl_sink)
 {
   const GstGLFuncs *gl = gl_sink->context->gl_vtable;
 
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0);
   gl->BindBuffer (GL_ARRAY_BUFFER, 0);
 
   gl->DisableVertexAttribArray (gl_sink->attr_position);
@@ -1390,15 +1416,27 @@ gst_glimage_sink_thread_init_redisplay (GstGLImageSink * gl_sink)
     gl->BindVertexArray (gl_sink->vao);
   }
 
-  gl->GenBuffers (1, &gl_sink->vertex_buffer);
-  _bind_buffer (gl_sink);
+  if (!gl_sink->vertex_buffer) {
+    gl->GenBuffers (1, &gl_sink->vertex_buffer);
+    gl->BindBuffer (GL_ARRAY_BUFFER, gl_sink->vertex_buffer);
+    gl->BufferData (GL_ARRAY_BUFFER, 4 * 5 * sizeof (GLfloat), vertices,
+        GL_STATIC_DRAW);
+  }
+
+  if (!gl_sink->vbo_indices) {
+    gl->GenBuffers (1, &gl_sink->vbo_indices);
+    gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, gl_sink->vbo_indices);
+    gl->BufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (indices), indices,
+        GL_STATIC_DRAW);
+  }
 
   if (gl->GenVertexArrays) {
+    _bind_buffer (gl_sink);
     gl->BindVertexArray (0);
-    gl->BindBuffer (GL_ARRAY_BUFFER, 0);
-  } else {
-    _unbind_buffer (gl_sink);
   }
+
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0);
+  gl->BindBuffer (GL_ARRAY_BUFFER, 0);
 }
 
 static void
@@ -1414,6 +1452,16 @@ gst_glimage_sink_cleanup_glthread (GstGLImageSink * gl_sink)
   if (gl_sink->vao) {
     gl->DeleteVertexArrays (1, &gl_sink->vao);
     gl_sink->vao = 0;
+  }
+
+  if (gl_sink->vertex_buffer) {
+    gl->DeleteBuffers (1, &gl_sink->vertex_buffer);
+    gl_sink->vertex_buffer = 0;
+  }
+
+  if (gl_sink->vbo_indices) {
+    gl->DeleteBuffers (1, &gl_sink->vbo_indices);
+    gl_sink->vbo_indices = 0;
   }
 }
 
@@ -1475,7 +1523,6 @@ gst_glimage_sink_on_draw (GstGLImageSink * gl_sink)
   gboolean do_redisplay = FALSE;
   GstGLSyncMeta *sync_meta = NULL;
   GstSample *sample = NULL;
-  GstCaps *caps = NULL;
 
   g_return_if_fail (GST_IS_GLIMAGE_SINK (gl_sink));
 
@@ -1504,34 +1551,28 @@ gst_glimage_sink_on_draw (GstGLImageSink * gl_sink)
     gl_sink->caps_change = FALSE;
   }
 
-  sync_meta = gst_buffer_get_gl_sync_meta (gl_sink->stored_buffer);
+  sync_meta = gst_buffer_get_gl_sync_meta (gl_sink->stored_sync);
   if (sync_meta)
-    gst_gl_sync_meta_wait (sync_meta, gl_sink->context);
+    gst_gl_sync_meta_wait (sync_meta, gst_gl_context_get_current ());
 
   /* make sure that the environnement is clean */
   gst_gl_context_clear_shader (gl_sink->context);
-
+  gl->BindTexture (GL_TEXTURE_2D, 0);
 #if GST_GL_HAVE_OPENGL
   if (USING_OPENGL (gl_sink->context))
     gl->Disable (GL_TEXTURE_2D);
 #endif
 
-  gl->BindTexture (GL_TEXTURE_2D, 0);
-
-  caps = gst_video_info_to_caps (&gl_sink->info);
-
   sample = gst_sample_new (gl_sink->stored_buffer,
-      caps, &GST_BASE_SINK (gl_sink)->segment, NULL);
+      gl_sink->caps, &GST_BASE_SINK (gl_sink)->segment, NULL);
 
   g_signal_emit (gl_sink, gst_glimage_sink_signals[CLIENT_DRAW_SIGNAL], 0,
       gl_sink->context, sample, &do_redisplay);
 
-  gst_caps_unref (caps);
   gst_sample_unref (sample);
 
   if (!do_redisplay) {
     gfloat alpha = gl_sink->ignore_alpha ? 1.0f : 0.0f;
-    GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
 
     gl->ClearColor (0.0, 0.0, 0.0, alpha);
     gl->Clear (GL_COLOR_BUFFER_BIT);
@@ -1554,7 +1595,7 @@ gst_glimage_sink_on_draw (GstGLImageSink * gl_sink)
     gl->BindTexture (GL_TEXTURE_2D, gl_sink->redisplay_texture);
     gst_gl_shader_set_uniform_1i (gl_sink->redisplay_shader, "tex", 0);
 
-    gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+    gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
     gst_gl_context_clear_shader (gl_sink->context);
 

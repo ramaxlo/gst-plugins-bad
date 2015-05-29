@@ -246,6 +246,8 @@ gst_dtls_dec_dispose (GObject * object)
     g_object_unref (self->connection);
     self->connection = NULL;
   }
+
+  G_OBJECT_CLASS (parent_class)->dispose (object);
 }
 
 static void
@@ -402,6 +404,12 @@ on_key_received (GstDtlsConnection * connection, gpointer key, guint cipher,
   self->srtp_auth = auth;
 
   key_dup = g_memdup (key, GST_DTLS_SRTP_MASTER_KEY_LENGTH);
+
+  if (self->decoder_key) {
+    gst_buffer_unref (self->decoder_key);
+    self->decoder_key = NULL;
+  }
+
   self->decoder_key =
       gst_buffer_new_wrapped (key_dup, GST_DTLS_SRTP_MASTER_KEY_LENGTH);
 
@@ -441,6 +449,10 @@ on_peer_certificate_received (GstDtlsConnection * connection, gchar * pem,
 
   GST_DEBUG_OBJECT (self, "Received peer certificate PEM: \n%s", pem);
 
+  if (self->peer_pem != NULL) {
+    g_free (self->peer_pem);
+    self->peer_pem = NULL;
+  }
   self->peer_pem = g_strdup (pem);
 
   ref = g_new (GWeakRef, 1);

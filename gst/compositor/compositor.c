@@ -214,11 +214,61 @@ gst_compositor_pad_set_property (GObject * object, guint prop_id,
   }
 }
 
+static void
+_mixer_pad_get_output_size (GstCompositor * comp,
+    GstCompositorPad * comp_pad, gint * width, gint * height)
+{
+  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR (comp);
+  GstVideoAggregatorPad *vagg_pad = GST_VIDEO_AGGREGATOR_PAD (comp_pad);
+  gint pad_width, pad_height;
+  guint dar_n, dar_d;
+
+  /* FIXME: Anything better we can do here? */
+  if (!vagg_pad->info.finfo
+      || vagg_pad->info.finfo->format == GST_VIDEO_FORMAT_UNKNOWN) {
+    GST_DEBUG_OBJECT (comp_pad, "Have no caps yet");
+    *width = 0;
+    *height = 0;
+    return;
+  }
+
+  pad_width =
+      comp_pad->width <=
+      0 ? GST_VIDEO_INFO_WIDTH (&vagg_pad->info) : comp_pad->width;
+  pad_height =
+      comp_pad->height <=
+      0 ? GST_VIDEO_INFO_HEIGHT (&vagg_pad->info) : comp_pad->height;
+
+  gst_video_calculate_display_ratio (&dar_n, &dar_d, pad_width, pad_height,
+      GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info)
+      );
+  GST_LOG_OBJECT (comp_pad, "scaling %ux%u by %u/%u (%u/%u / %u/%u)", pad_width,
+      pad_height, dar_n, dar_d, GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info));
+
+  if (pad_height % dar_n == 0) {
+    pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
+  } else if (pad_width % dar_d == 0) {
+    pad_height = gst_util_uint64_scale_int (pad_width, dar_d, dar_n);
+  } else {
+    pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
+  }
+
+  if (width)
+    *width = pad_width;
+  if (height)
+    *height = pad_height;
+}
+
 static gboolean
 gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
     GstVideoAggregator * vagg G_GNUC_UNUSED,
     GstVideoInfo * current_info, GstVideoInfo * wanted_info)
 {
+  GstCompositor *comp = GST_COMPOSITOR (vagg);
   GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
   gchar *colorimetry, *best_colorimetry;
   const gchar *chroma, *best_chroma;
@@ -242,15 +292,7 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
       gst_video_colorimetry_to_string (&(wanted_info->colorimetry));
   best_chroma = gst_video_chroma_to_string (wanted_info->chroma_site);
 
-  if (cpad->width > 0)
-    width = cpad->width;
-  else
-    width = current_info->width;
-
-  if (cpad->height > 0)
-    height = cpad->height;
-  else
-    height = current_info->height;
+  _mixer_pad_get_output_size (comp, cpad, &width, &height);
 
   if (GST_VIDEO_INFO_FORMAT (wanted_info) !=
       GST_VIDEO_INFO_FORMAT (current_info)
@@ -268,8 +310,8 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
         width, height);
     tmp_info.chroma_site = wanted_info->chroma_site;
     tmp_info.colorimetry = wanted_info->colorimetry;
-    tmp_info.par_n = current_info->par_n;
-    tmp_info.par_d = current_info->par_d;
+    tmp_info.par_n = vagg->info.par_n;
+    tmp_info.par_d = vagg->info.par_d;
     tmp_info.fps_n = current_info->fps_n;
     tmp_info.fps_d = current_info->fps_d;
     tmp_info.flags = current_info->flags;
@@ -278,6 +320,7 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
     GST_DEBUG_OBJECT (pad, "This pad will be converted from %d to %d",
         GST_VIDEO_INFO_FORMAT (current_info),
         GST_VIDEO_INFO_FORMAT (&tmp_info));
+
     cpad->convert = gst_video_converter_new (current_info, &tmp_info, NULL);
     cpad->conversion_info = tmp_info;
     if (!cpad->convert) {
@@ -296,10 +339,22 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
   return TRUE;
 }
 
+/* Test whether rectangle2 contains rectangle 1 (geometrically) */
+static gboolean
+is_rectangle_contained (GstVideoRectangle rect1, GstVideoRectangle rect2)
+{
+  if ((rect2.x <= rect1.x) && (rect2.y <= rect1.y) &&
+      ((rect2.x + rect2.w) >= (rect1.x + rect1.w)) &&
+      ((rect2.y + rect2.h) >= (rect1.y + rect1.h)))
+    return TRUE;
+  return FALSE;
+}
+
 static gboolean
 gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     GstVideoAggregator * vagg)
 {
+  GstCompositor *comp = GST_COMPOSITOR (vagg);
   GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
   guint outsize;
   GstVideoFrame *converted_frame;
@@ -307,32 +362,33 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
   GstVideoFrame *frame;
   static GstAllocationParams params = { 0, 15, 0, 0, };
   gint width, height;
+  gboolean frame_obscured = FALSE;
+  GList *l;
+  /* The rectangle representing this frame, clamped to the video's boundaries.
+   * Due to the clamping, this is different from the frame width/height above. */
+  GstVideoRectangle frame_rect;
 
   if (!pad->buffer)
     return TRUE;
 
-  frame = g_slice_new0 (GstVideoFrame);
+  /* There's three types of width/height here:
+   * 1. GST_VIDEO_FRAME_WIDTH/HEIGHT:
+   *     The frame width/height (same as pad->buffer_vinfo.height/width;
+   *     see gst_video_frame_map())
+   * 2. cpad->width/height:
+   *     The optional pad property for scaling the frame (if zero, the video is
+   *     left unscaled)
+   * 3. conversion_info.width/height:
+   *     Equal to cpad->width/height if it's set, otherwise it's the pad
+   *     width/height. See ->set_info()
+   * */
 
-  if (!gst_video_frame_map (frame, &pad->buffer_vinfo, pad->buffer,
-          GST_MAP_READ)) {
-    GST_WARNING_OBJECT (vagg, "Could not map input buffer");
-    return FALSE;
-  }
-
-  if (cpad->width > 0)
-    width = cpad->width;
-  else
-    width = GST_VIDEO_FRAME_WIDTH (frame);
-
-  if (cpad->height > 0)
-    height = cpad->height;
-  else
-    height = GST_VIDEO_FRAME_HEIGHT (frame);
+  _mixer_pad_get_output_size (comp, cpad, &width, &height);
 
   /* The only thing that can change here is the width
    * and height, otherwise set_info would've been called */
-  if (cpad->conversion_info.width != width ||
-      cpad->conversion_info.height != height) {
+  if (GST_VIDEO_INFO_WIDTH (&cpad->conversion_info) != width ||
+      GST_VIDEO_INFO_HEIGHT (&cpad->conversion_info) != height) {
     gchar *colorimetry, *wanted_colorimetry;
     const gchar *chroma, *wanted_chroma;
 
@@ -344,68 +400,127 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
       gst_video_converter_free (cpad->convert);
     cpad->convert = NULL;
 
-    colorimetry = gst_video_colorimetry_to_string (&frame->info.colorimetry);
-    chroma = gst_video_chroma_to_string (frame->info.chroma_site);
+    colorimetry =
+        gst_video_colorimetry_to_string (&pad->buffer_vinfo.colorimetry);
+    chroma = gst_video_chroma_to_string (pad->buffer_vinfo.chroma_site);
 
     wanted_colorimetry =
         gst_video_colorimetry_to_string (&cpad->conversion_info.colorimetry);
     wanted_chroma =
         gst_video_chroma_to_string (cpad->conversion_info.chroma_site);
 
-    if (GST_VIDEO_INFO_FORMAT (&frame->info) !=
+    if (GST_VIDEO_INFO_FORMAT (&pad->buffer_vinfo) !=
         GST_VIDEO_INFO_FORMAT (&cpad->conversion_info)
         || g_strcmp0 (colorimetry, wanted_colorimetry)
         || g_strcmp0 (chroma, wanted_chroma)
-        || width != GST_VIDEO_FRAME_WIDTH (frame)
-        || height != GST_VIDEO_FRAME_HEIGHT (frame)) {
+        || width != GST_VIDEO_INFO_WIDTH (&pad->buffer_vinfo)
+        || height != GST_VIDEO_INFO_HEIGHT (&pad->buffer_vinfo)) {
       GstVideoInfo tmp_info;
 
       gst_video_info_set_format (&tmp_info, cpad->conversion_info.finfo->format,
           width, height);
       tmp_info.chroma_site = cpad->conversion_info.chroma_site;
       tmp_info.colorimetry = cpad->conversion_info.colorimetry;
-      tmp_info.par_n = cpad->conversion_info.par_n;
-      tmp_info.par_d = cpad->conversion_info.par_d;
+      tmp_info.par_n = vagg->info.par_n;
+      tmp_info.par_d = vagg->info.par_d;
       tmp_info.fps_n = cpad->conversion_info.fps_n;
       tmp_info.fps_d = cpad->conversion_info.fps_d;
       tmp_info.flags = cpad->conversion_info.flags;
       tmp_info.interlace_mode = cpad->conversion_info.interlace_mode;
 
       GST_DEBUG_OBJECT (pad, "This pad will be converted from %d to %d",
-          GST_VIDEO_INFO_FORMAT (&frame->info),
+          GST_VIDEO_INFO_FORMAT (&pad->buffer_vinfo),
           GST_VIDEO_INFO_FORMAT (&tmp_info));
-      cpad->convert = gst_video_converter_new (&frame->info, &tmp_info, NULL);
+
+      cpad->convert =
+          gst_video_converter_new (&pad->buffer_vinfo, &tmp_info, NULL);
       cpad->conversion_info = tmp_info;
 
       if (!cpad->convert) {
         GST_WARNING_OBJECT (pad, "No path found for conversion");
         g_free (colorimetry);
         g_free (wanted_colorimetry);
-        gst_video_frame_unmap (frame);
-        g_slice_free (GstVideoFrame, frame);
         return FALSE;
       }
     } else {
-      cpad->conversion_info.width = width;
-      cpad->conversion_info.height = height;
+      GST_VIDEO_INFO_WIDTH (&cpad->conversion_info) = width;
+      GST_VIDEO_INFO_HEIGHT (&cpad->conversion_info) = height;
     }
 
     g_free (colorimetry);
     g_free (wanted_colorimetry);
   }
 
+  /* Clamp the x/y coordinates of this frame to the video boundaries to cover
+   * the case where (say, with negative xpos/ypos) the non-obscured portion of
+   * the frame could be outside the bounds of the video itself and hence not
+   * visible at all */
+  frame_rect.x = CLAMP (cpad->xpos, 0, GST_VIDEO_INFO_WIDTH (&vagg->info));
+  frame_rect.y = CLAMP (cpad->ypos, 0, GST_VIDEO_INFO_HEIGHT (&vagg->info));
+  /* Clamp the width/height to the frame boundaries as well */
+  frame_rect.w = MAX (width - frame_rect.x, 0);
+  frame_rect.h = MAX (height - frame_rect.y, 0);
+
+  GST_OBJECT_LOCK (vagg);
+  /* Check if this frame is obscured by a higher-zorder frame
+   * TODO: Also skip a frame if it's obscured by a combination of
+   * higher-zorder frames */
+  for (l = g_list_find (GST_ELEMENT (vagg)->sinkpads, pad)->next; l;
+      l = l->next) {
+    GstVideoRectangle frame2_rect;
+    GstVideoAggregatorPad *pad2 = l->data;
+    GstCompositorPad *cpad2 = GST_COMPOSITOR_PAD (pad2);
+    gint pad2_width, pad2_height;
+
+    _mixer_pad_get_output_size (comp, cpad2, &pad2_width, &pad2_height);
+
+    /* We don't need to clamp the coords of the second rectangle */
+    frame2_rect.x = cpad2->xpos;
+    frame2_rect.y = cpad2->ypos;
+    /* This is effectively what set_info and the above conversion
+     * code do to calculate the desired width/height */
+    frame2_rect.w = pad2_width;
+    frame2_rect.h = pad2_height;
+
+    /* Check if there's a buffer to be aggregated, ensure it can't have an alpha
+     * channel, then check opacity and frame boundaries */
+    if (pad2->buffer && cpad2->alpha == 1.0 &&
+        !GST_VIDEO_INFO_HAS_ALPHA (&pad2->info) &&
+        is_rectangle_contained (frame_rect, frame2_rect)) {
+      frame_obscured = TRUE;
+      GST_DEBUG_OBJECT (pad, "Obscured by %s, skipping frame",
+          GST_PAD_NAME (pad2));
+      break;
+    }
+  }
+  GST_OBJECT_UNLOCK (vagg);
+
+  if (frame_obscured) {
+    converted_frame = NULL;
+    goto done;
+  }
+
   if (cpad->alpha == 0.0) {
     GST_DEBUG_OBJECT (vagg, "Pad has alpha 0.0, not converting frame");
     converted_frame = NULL;
-    gst_video_frame_unmap (frame);
-    g_slice_free (GstVideoFrame, frame);
-  } else if (cpad->convert) {
+    goto done;
+  }
+
+  frame = g_slice_new0 (GstVideoFrame);
+
+  if (!gst_video_frame_map (frame, &pad->buffer_vinfo, pad->buffer,
+          GST_MAP_READ)) {
+    GST_WARNING_OBJECT (vagg, "Could not map input buffer");
+    return FALSE;
+  }
+
+  if (cpad->convert) {
     gint converted_size;
 
     converted_frame = g_slice_new0 (GstVideoFrame);
 
     /* We wait until here to set the conversion infos, in case vagg->info changed */
-    converted_size = cpad->conversion_info.size;
+    converted_size = GST_VIDEO_INFO_SIZE (&cpad->conversion_info);
     outsize = GST_VIDEO_INFO_SIZE (&vagg->info);
     converted_size = converted_size > outsize ? converted_size : outsize;
     converted_buf = gst_buffer_new_allocate (NULL, converted_size, &params);
@@ -428,6 +543,7 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     converted_frame = frame;
   }
 
+done:
   pad->aggregated_frame = converted_frame;
 
   return TRUE;
@@ -752,6 +868,9 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
 
   gst_video_info_from_caps (&info, caps);
 
+  /* FIXME: this doesn't work for non 1/1 output par's as we don't have that
+   * information available at this time */
+
   GST_OBJECT_LOCK (vagg);
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *vaggpad = l->data;
@@ -759,15 +878,8 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     gint this_width, this_height;
     gint width, height;
 
-    if (compositor_pad->width > 0)
-      width = compositor_pad->width;
-    else
-      width = GST_VIDEO_INFO_WIDTH (&vaggpad->info);
-
-    if (compositor_pad->height > 0)
-      height = compositor_pad->height;
-    else
-      height = GST_VIDEO_INFO_HEIGHT (&vaggpad->info);
+    _mixer_pad_get_output_size (GST_COMPOSITOR (vagg), compositor_pad, &width,
+        &height);
 
     if (width == 0 || height == 0)
       continue;
@@ -787,6 +899,9 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     info.height = best_height;
     if (set_functions (GST_COMPOSITOR (vagg), &info))
       ret = gst_video_info_to_caps (&info);
+
+    gst_caps_set_simple (ret, "pixel-aspect-ratio", GST_TYPE_FRACTION_RANGE,
+        1, G_MAXINT, G_MAXINT, 1, NULL);
   }
 
   return ret;
@@ -808,6 +923,8 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
   outframe = &out_frame;
   /* default to blending */
   composite = self->blend;
+  /* TODO: If the frames to be composited completely obscure the background,
+   * don't bother drawing the background at all. */
   switch (self->background) {
     case COMPOSITOR_BACKGROUND_CHECKER:
       self->fill_checker (outframe);

@@ -621,9 +621,59 @@ gst_gl_video_mixer_get_property (GObject * object, guint prop_id,
   }
 }
 
+static void
+_mixer_pad_get_output_size (GstGLVideoMixer * mix,
+    GstGLVideoMixerPad * mix_pad, gint * width, gint * height)
+{
+  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR (mix);
+  GstVideoAggregatorPad *vagg_pad = GST_VIDEO_AGGREGATOR_PAD (mix_pad);
+  gint pad_width, pad_height;
+  guint dar_n, dar_d;
+
+  /* FIXME: Anything better we can do here? */
+  if (!vagg_pad->info.finfo
+      || vagg_pad->info.finfo->format == GST_VIDEO_FORMAT_UNKNOWN) {
+    GST_DEBUG_OBJECT (mix_pad, "Have no caps yet");
+    *width = 0;
+    *height = 0;
+    return;
+  }
+
+  pad_width =
+      mix_pad->width <=
+      0 ? GST_VIDEO_INFO_WIDTH (&vagg_pad->info) : mix_pad->width;
+  pad_height =
+      mix_pad->height <=
+      0 ? GST_VIDEO_INFO_HEIGHT (&vagg_pad->info) : mix_pad->height;
+
+  gst_video_calculate_display_ratio (&dar_n, &dar_d, pad_width, pad_height,
+      GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info)
+      );
+  GST_LOG_OBJECT (mix_pad, "scaling %ux%u by %u/%u (%u/%u / %u/%u)", pad_width,
+      pad_height, dar_n, dar_d, GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info));
+
+  if (pad_height % dar_n == 0) {
+    pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
+  } else if (pad_width % dar_d == 0) {
+    pad_height = gst_util_uint64_scale_int (pad_width, dar_d, dar_n);
+  } else {
+    pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
+  }
+
+  if (width)
+    *width = pad_width;
+  if (height)
+    *height = pad_height;
+}
+
 static GstCaps *
 _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
 {
+  GstGLVideoMixer *mix = GST_GL_VIDEO_MIXER (vagg);
   GList *l;
   gint best_width = -1, best_height = -1;
   GstVideoInfo info;
@@ -640,15 +690,7 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     gint this_width, this_height;
     gint width, height;
 
-    if (mixer_pad->width > 0)
-      width = mixer_pad->width;
-    else
-      width = GST_VIDEO_INFO_WIDTH (&vaggpad->info);
-
-    if (mixer_pad->height > 0)
-      height = mixer_pad->height;
-    else
-      height = GST_VIDEO_INFO_HEIGHT (&vaggpad->info);
+    _mixer_pad_get_output_size (mix, mixer_pad, &width, &height);
 
     if (width == 0 || height == 0)
       continue;
@@ -699,6 +741,11 @@ _reset_gl (GstGLContext * context, GstGLVideoMixer * video_mixer)
   if (video_mixer->vao) {
     gl->DeleteVertexArrays (1, &video_mixer->vao);
     video_mixer->vao = 0;
+  }
+
+  if (video_mixer->vbo_indices) {
+    gl->DeleteBuffers (1, &video_mixer->vbo_indices);
+    video_mixer->vbo_indices = 0;
   }
 
   gst_aggregator_iterate_sinkpads (GST_AGGREGATOR (video_mixer), _reset_pad_gl,
@@ -758,6 +805,21 @@ gst_gl_video_mixer_process_textures (GstGLMixer * mix, GPtrArray * frames,
   return TRUE;
 }
 
+static const GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
+
+static void
+_init_vbo_indices (GstGLVideoMixer * mixer)
+{
+  const GstGLFuncs *gl = GST_GL_BASE_MIXER (mixer)->context->gl_vtable;
+
+  if (!mixer->vbo_indices) {
+    gl->GenBuffers (1, &mixer->vbo_indices);
+    gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, mixer->vbo_indices);
+    gl->BufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (indices), indices,
+        GL_STATIC_DRAW);
+  }
+}
+
 static gboolean
 _draw_checker_background (GstGLVideoMixer * video_mixer)
 {
@@ -765,10 +827,6 @@ _draw_checker_background (GstGLVideoMixer * video_mixer)
   const GstGLFuncs *gl = GST_GL_BASE_MIXER (mixer)->context->gl_vtable;
   gint attr_position_loc = 0;
 
-  const GLushort indices[] = {
-    0, 1, 2,
-    0, 2, 3
-  };
   /* *INDENT-OFF* */
   gfloat v_vertices[] = {
     -1.0,-1.0,-1.0f,
@@ -788,12 +846,15 @@ _draw_checker_background (GstGLVideoMixer * video_mixer)
   attr_position_loc =
       gst_gl_shader_get_attribute_location (video_mixer->checker, "a_position");
 
+  _init_vbo_indices (video_mixer);
+
   if (!video_mixer->checker_vbo) {
     gl->GenBuffers (1, &video_mixer->checker_vbo);
     gl->BindBuffer (GL_ARRAY_BUFFER, video_mixer->checker_vbo);
     gl->BufferData (GL_ARRAY_BUFFER, 4 * 3 * sizeof (GLfloat), v_vertices,
         GL_STATIC_DRAW);
   } else {
+    gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, video_mixer->vbo_indices);
     gl->BindBuffer (GL_ARRAY_BUFFER, video_mixer->checker_vbo);
   }
 
@@ -802,9 +863,10 @@ _draw_checker_background (GstGLVideoMixer * video_mixer)
 
   gl->EnableVertexAttribArray (attr_position_loc);
 
-  gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+  gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
   gl->DisableVertexAttribArray (attr_position_loc);
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0);
   gl->BindBuffer (GL_ARRAY_BUFFER, 0);
 
   return TRUE;
@@ -844,6 +906,7 @@ static void
 gst_gl_video_mixer_callback (gpointer stuff)
 {
   GstGLVideoMixer *video_mixer = GST_GL_VIDEO_MIXER (stuff);
+  GstVideoAggregator *vagg = GST_VIDEO_AGGREGATOR (stuff);
   GstGLMixer *mixer = GST_GL_MIXER (video_mixer);
   GstGLFuncs *gl = GST_GL_BASE_MIXER (mixer)->context->gl_vtable;
 
@@ -851,21 +914,13 @@ gst_gl_video_mixer_callback (gpointer stuff)
   GLint attr_texture_loc = 0;
   guint out_width, out_height;
 
-  const GLushort indices[] = {
-    0, 1, 2,
-    0, 2, 3
-  };
-
   guint count = 0;
 
-  out_width = GST_VIDEO_INFO_WIDTH (&GST_VIDEO_AGGREGATOR (stuff)->info);
-  out_height = GST_VIDEO_INFO_HEIGHT (&GST_VIDEO_AGGREGATOR (stuff)->info);
+  out_width = GST_VIDEO_INFO_WIDTH (&vagg->info);
+  out_height = GST_VIDEO_INFO_HEIGHT (&vagg->info);
 
   gst_gl_context_clear_shader (GST_GL_BASE_MIXER (mixer)->context);
   gl->BindTexture (GL_TEXTURE_2D, 0);
-  if (gst_gl_context_get_gl_api (GST_GL_BASE_MIXER (mixer)->context) &
-      GST_GL_API_OPENGL)
-    gl->Disable (GL_TEXTURE_2D);
 
   gl->Disable (GL_DEPTH_TEST);
   gl->Disable (GL_CULL_FACE);
@@ -891,6 +946,7 @@ gst_gl_video_mixer_callback (gpointer stuff)
   while (count < video_mixer->input_frames->len) {
     GstGLMixerFrameData *frame;
     GstGLVideoMixerPad *pad;
+    GstVideoInfo *v_info;
     guint in_tex;
     guint in_width, in_height;
 
@@ -910,8 +966,9 @@ gst_gl_video_mixer_callback (gpointer stuff)
       continue;
     }
     pad = (GstGLVideoMixerPad *) frame->pad;
-    in_width = GST_VIDEO_INFO_WIDTH (&GST_VIDEO_AGGREGATOR_PAD (pad)->info);
-    in_height = GST_VIDEO_INFO_HEIGHT (&GST_VIDEO_AGGREGATOR_PAD (pad)->info);
+    v_info = &GST_VIDEO_AGGREGATOR_PAD (pad)->info;
+    in_width = GST_VIDEO_INFO_WIDTH (v_info);
+    in_height = GST_VIDEO_INFO_HEIGHT (v_info);
 
     if (!frame->texture || in_width <= 0 || in_height <= 0
         || pad->alpha == 0.0f) {
@@ -923,12 +980,13 @@ gst_gl_video_mixer_callback (gpointer stuff)
 
     in_tex = frame->texture;
 
+    _init_vbo_indices (video_mixer);
+
     if (pad->geometry_change || !pad->vertex_buffer) {
-      guint pad_width, pad_height;
+      gint pad_width, pad_height;
       gfloat w, h;
 
-      pad_width = pad->width <= 0 ? in_width : pad->width;
-      pad_height = pad->height <= 0 ? in_height : pad->height;
+      _mixer_pad_get_output_size (video_mixer, pad, &pad_width, &pad_height);
 
       w = ((gfloat) pad_width / (gfloat) out_width);
       h = ((gfloat) pad_height / (gfloat) out_height);
@@ -954,9 +1012,12 @@ gst_gl_video_mixer_callback (gpointer stuff)
 
       gl->BufferData (GL_ARRAY_BUFFER, 4 * 5 * sizeof (GLfloat), v_vertices,
           GL_STATIC_DRAW);
+
+      pad->geometry_change = FALSE;
     } else {
       gl->BindBuffer (GL_ARRAY_BUFFER, pad->vertex_buffer);
     }
+    gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, video_mixer->vbo_indices);
 
     gl->BlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     gl->BlendEquation (GL_FUNC_ADD);
@@ -975,7 +1036,7 @@ gst_gl_video_mixer_callback (gpointer stuff)
     gl->VertexAttribPointer (attr_texture_loc, 2, GL_FLOAT,
         GL_FALSE, 5 * sizeof (GLfloat), (void *) (3 * sizeof (GLfloat)));
 
-    gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+    gl->DrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
     ++count;
   }
@@ -986,6 +1047,7 @@ gst_gl_video_mixer_callback (gpointer stuff)
   if (gl->GenVertexArrays)
     gl->BindVertexArray (0);
 
+  gl->BindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0);
   gl->BindBuffer (GL_ARRAY_BUFFER, 0);
   gl->BindTexture (GL_TEXTURE_2D, 0);
 

@@ -82,7 +82,6 @@ static void gst_gl_test_src_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 
 static gboolean gst_gl_test_src_setcaps (GstBaseSrc * bsrc, GstCaps * caps);
-static GstCaps *gst_gl_test_src_getcaps (GstBaseSrc * bsrc, GstCaps * filter);
 static GstCaps *gst_gl_test_src_fixate (GstBaseSrc * bsrc, GstCaps * caps);
 
 static gboolean gst_gl_test_src_is_seekable (GstBaseSrc * psrc);
@@ -181,7 +180,6 @@ gst_gl_test_src_class_init (GstGLTestSrcClass * klass)
   element_class->change_state = gst_gl_test_src_change_state;
 
   gstbasesrc_class->set_caps = gst_gl_test_src_setcaps;
-  gstbasesrc_class->get_caps = gst_gl_test_src_getcaps;
   gstbasesrc_class->is_seekable = gst_gl_test_src_is_seekable;
   gstbasesrc_class->do_seek = gst_gl_test_src_do_seek;
   gstbasesrc_class->query = gst_gl_test_src_query;
@@ -449,24 +447,6 @@ wrong_caps:
     GST_WARNING ("wrong caps");
     return FALSE;
   }
-}
-
-static GstCaps *
-gst_gl_test_src_getcaps (GstBaseSrc * bsrc, GstCaps * filter)
-{
-  GstCaps *tmp = NULL;
-  GstCaps *result =
-      gst_caps_from_string ("video/x-raw(memory:GLMemory),format=RGBA");
-
-  if (filter) {
-    tmp = gst_caps_intersect_full (filter, result, GST_CAPS_INTERSECT_FIRST);
-    gst_caps_unref (result);
-    result = tmp;
-  }
-
-  GST_DEBUG_OBJECT (bsrc, "returning caps: %" GST_PTR_FORMAT, result);
-
-  return result;
 }
 
 static void
@@ -806,8 +786,10 @@ gst_gl_test_src_decide_allocation (GstBaseSrc * basesrc, GstQuery * query)
           gst_gl_display_get_gl_context_for_thread (src->display, NULL);
       if (!src->context) {
         src->context = gst_gl_context_new (src->display);
-        if (!gst_gl_context_create (src->context, src->other_context, &error))
+        if (!gst_gl_context_create (src->context, src->other_context, &error)) {
+          GST_OBJECT_UNLOCK (src->display);
           goto context_error;
+        }
       }
     } while (!gst_gl_display_add_context (src->display, src->context));
     GST_OBJECT_UNLOCK (src->display);
@@ -869,7 +851,8 @@ context_error:
   {
     GST_ELEMENT_ERROR (src, RESOURCE, NOT_FOUND, ("%s", error->message),
         (NULL));
-    gst_object_unref (src->context);
+    if (src->context)
+      gst_object_unref (src->context);
     src->context = NULL;
     return FALSE;
   }

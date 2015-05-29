@@ -27,16 +27,6 @@
 #include <gst/gl/gl.h>
 #include "gstgluploadelement.h"
 
-#if GST_GL_HAVE_PLATFORM_EGL
-#include <gst/gl/egl/gsteglimagememory.h>
-#endif
-
-#define USING_OPENGL(context) (gst_gl_context_check_gl_version (context, GST_GL_API_OPENGL, 1, 0))
-#define USING_OPENGL3(context) (gst_gl_context_check_gl_version (context, GST_GL_API_OPENGL3, 3, 1))
-#define USING_GLES(context) (gst_gl_context_check_gl_version (context, GST_GL_API_GLES, 1, 0))
-#define USING_GLES2(context) (gst_gl_context_check_gl_version (context, GST_GL_API_GLES2, 2, 0))
-#define USING_GLES3(context) (gst_gl_context_check_gl_version (context, GST_GL_API_GLES2, 3, 0))
-
 GST_DEBUG_CATEGORY_STATIC (gst_gl_upload_element_debug);
 #define GST_CAT_DEFAULT gst_gl_upload_element_debug
 
@@ -72,17 +62,12 @@ GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("video/x-raw(ANY)"));
 
-static GstStaticPadTemplate gst_gl_upload_element_sink_pad_template =
-GST_STATIC_PAD_TEMPLATE ("sink",
-    GST_PAD_SINK,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw(ANY)"));
-
 static void
 gst_gl_upload_element_class_init (GstGLUploadElementClass * klass)
 {
   GstBaseTransformClass *bt_class = GST_BASE_TRANSFORM_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
+  GstCaps *upload_caps;
 
   bt_class->query = gst_gl_upload_element_query;
   bt_class->transform_caps = _gst_gl_upload_element_transform_caps;
@@ -98,8 +83,11 @@ gst_gl_upload_element_class_init (GstGLUploadElementClass * klass)
 
   gst_element_class_add_pad_template (element_class,
       gst_static_pad_template_get (&gst_gl_upload_element_src_pad_template));
+
+  upload_caps = gst_gl_upload_get_input_template_caps ();
   gst_element_class_add_pad_template (element_class,
-      gst_static_pad_template_get (&gst_gl_upload_element_sink_pad_template));
+      gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS, upload_caps));
+  gst_caps_unref (upload_caps);
 
   gst_element_class_set_metadata (element_class,
       "OpenGL uploader", "Filter/Video",
